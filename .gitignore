@@ -4,3 +4,7 @@ __pycache__/
 *.pyo
 *.db
 .env
+agent/agent_config.json
+*.safetensors
+*.png
+*.jpg

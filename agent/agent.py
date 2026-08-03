@@ -3,6 +3,8 @@ import argparse, json, platform, socket, subprocess, time
 from pathlib import Path
 import requests
 
+import comfy
+
 CONFIG=Path(__file__).with_name("agent_config.json")
 OLLAMA="http://127.0.0.1:11434"
 
@@ -12,18 +14,24 @@ def cmd(args):
     except Exception:
         return ""
 
-def capabilities():
-    gpu=cmd(["nvidia-smi","--query-gpu=name,memory.total","--format=csv,noheader"])
+def ollama_models():
     try:
         models=requests.get(f"{OLLAMA}/api/tags",timeout=5).json().get("models",[])
-        names=[m.get("name") for m in models]
+        return [m.get("name") for m in models]
     except Exception:
-        names=[]
+        return []
+
+def capabilities():
+    gpu=cmd(["nvidia-smi","--query-gpu=name,memory.total","--format=csv,noheader"])
+    text_models=ollama_models()
+    image_models=comfy.models()
     return json.dumps({
         "hostname":socket.gethostname(),
         "os":platform.system(),
         "gpu":gpu.splitlines() if gpu else [],
-        "ollama_models":names
+        "ollama_models":text_models,
+        "image_models":image_models,
+        "services":{"ollama":bool(text_models),"comfyui":bool(image_models)}
     },ensure_ascii=False)
 
 def register(server,name):
@@ -51,6 +59,7 @@ def infer(model,prompt):
     r.raise_for_status()
     b=r.json()
     return json.dumps({
+        "type":"text",
         "response":b.get("response",""),
         "prompt_tokens":b.get("prompt_eval_count"),
         "output_tokens":b.get("eval_count"),
@@ -59,6 +68,13 @@ def infer(model,prompt):
         "eval_duration_ns":b.get("eval_duration")
     },ensure_ascii=False)
 
+def execute(job):
+    """Elige el backend segun el modelo pedido."""
+    model=job["model"]
+    if comfy.is_image_model(model):
+        return comfy.generate(model,job["prompt"])
+    return infer(model,job["prompt"])
+
 def main():
     p=argparse.ArgumentParser()
     p.add_argument("--server",required=True)
@@ -66,11 +82,22 @@ def main():
     p.add_argument("--register",action="store_true")
     args=p.parse_args()
 
-    requests.get(f"{OLLAMA}/api/tags",timeout=10).raise_for_status()
+    has_ollama=bool(ollama_models())
+    has_comfy=comfy.available()
+    if not has_ollama and not has_comfy:
+        raise SystemExit(
+            "Este nodo no tiene ningun backend disponible.\n"
+            f"  Ollama en {OLLAMA}: no responde o sin modelos\n"
+            f"  ComfyUI en {comfy.COMFY}: no responde o falta {comfy.WORKFLOW.name}"
+        )
+
     config=register(args.server,args.name) if args.register or not CONFIG.exists() else json.loads(CONFIG.read_text())
     config["server"]=args.server.rstrip("/")
     auth={"node_id":config["node_id"],"token":config["token"]}
+
+    backends=[n for n,ok in (("ollama",has_ollama),("comfyui",has_comfy)) if ok]
     print(f"Agente Sauzal conectado: {config['node_id']}")
+    print(f"Backends activos: {', '.join(backends)}")
 
     while True:
         try:
@@ -80,15 +107,17 @@ def main():
             r.raise_for_status()
             job=r.json()["job"]
             if job:
-                print(f"Ejecutando {job['job_id']} con {job['model']}")
+                kind="imagen" if comfy.is_image_model(job["model"]) else "texto"
+                print(f"Ejecutando {job['job_id']} [{kind}] con {job['model']}")
                 try:
-                    output=infer(job["model"],job["prompt"])
+                    output=execute(job)
                     payload={**auth,"success":True,"result":output}
                 except Exception as exc:
+                    print("  fallo:",repr(exc))
                     payload={**auth,"success":False,"error":repr(exc)}
                 requests.post(
                     f"{config['server']}/jobs/{job['job_id']}/result",
-                    json=payload,timeout=30
+                    json=payload,timeout=120
                 ).raise_for_status()
         except requests.RequestException as exc:
             print("Error:",exc)
