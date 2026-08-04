@@ -11,6 +11,21 @@ if [ -z "$SAUZAL_SERVER" ]; then
   exit 1
 fi
 
+echo "== Arrancando Ollama =="
+ollama serve > /workspace/ollama.log 2>&1 &
+OLLAMA_PID=$!
+
+echo "Esperando a que Ollama responda en :11434..."
+until curl -sf http://127.0.0.1:11434 > /dev/null 2>&1; do
+  if ! kill -0 "$OLLAMA_PID" 2>/dev/null; then
+    echo "Ollama se cayo al arrancar. Log:"
+    cat /workspace/ollama.log
+    exit 1
+  fi
+  sleep 2
+done
+echo "Ollama listo."
+
 echo "== Arrancando ComfyUI =="
 cd /workspace/ComfyUI
 python3 main.py --listen 0.0.0.0 --port 8188 > /workspace/comfyui.log 2>&1 &

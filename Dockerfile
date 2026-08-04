@@ -1,5 +1,5 @@
 # ============================================================
-# Sauzal · imagen de nodo GPU (ComfyUI + FLUX.1-schnell + agente)
+# Sauzal · imagen de nodo GPU (ComfyUI + FLUX.1-schnell + Ollama + agente)
 # Pensada para RunPod (o cualquier host con NVIDIA Container Toolkit)
 # ============================================================
 
@@ -30,6 +30,15 @@ RUN pip3 install --no-cache-dir -r requirements.txt
 RUN mkdir -p models/checkpoints && \
     wget -q --show-progress --progress=dot:giga -O models/checkpoints/flux1-schnell-fp8.safetensors \
     https://huggingface.co/Comfy-Org/flux1-schnell/resolve/main/flux1-schnell-fp8.safetensors
+
+# ---- Ollama ----
+RUN curl -fsSL https://ollama.com/install.sh | sh
+
+# Hornea el modelo de texto por defecto en la imagen (evita descargarlo en cada Pod nuevo)
+RUN ollama serve & \
+    sleep 5 && \
+    ollama pull gemma3:4b && \
+    sleep 2
 
 # ---- Repo Sauzal (agente) ----
 WORKDIR /workspace

@@ -17,13 +17,22 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
+      - name: Espacio disponible (antes de limpiar)
+        run: df -h /
+
       - name: Liberar espacio en el runner
-        run: |
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /usr/local/lib/android
-          sudo rm -rf /opt/ghc
-          sudo rm -rf /opt/hostedtoolcache/CodeQL
-          sudo docker image prune -af
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+
+      - name: Espacio disponible (despues de limpiar)
+        run: df -h /
 
       - name: Login a Docker Hub
         uses: docker/login-action@v3
@@ -40,3 +49,7 @@ jobs:
           context: .
           push: true
           tags: ${{ secrets.DOCKERHUB_USERNAME }}/sauzal-node:latest
+
+      - name: Espacio disponible (despues del build)
+        if: always()
+        run: df -h /
