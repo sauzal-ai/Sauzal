@@ -28,7 +28,7 @@ RUN pip3 install --no-cache-dir -r requirements.txt
 # ---- Modelo FLUX.1-schnell fp8 (17.2 GB, Apache 2.0) ----
 # Horneado en la imagen para no re-descargar en cada Pod nuevo.
 RUN mkdir -p models/checkpoints && \
-    wget -q --show-progress -O models/checkpoints/flux1-schnell-fp8.safetensors \
+    wget -q --show-progress --progress=dot:giga -O models/checkpoints/flux1-schnell-fp8.safetensors \
     https://huggingface.co/Comfy-Org/flux1-schnell/resolve/main/flux1-schnell-fp8.safetensors
 
 # ---- Repo Sauzal (agente) ----
