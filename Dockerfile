@@ -16,6 +16,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         git \
         wget \
         curl \
+        zstd \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /workspace
