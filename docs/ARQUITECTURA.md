@@ -466,6 +466,28 @@ Esto está probado con threads reales (no simulado) en
 `test_same_session_concurrent_requests_do_not_corrupt_history` (dos
 pedidos simultáneos de la misma sesión, ninguno se pierde).
 
+### Sauzal NO cachea respuestas — pero sí ignora reintentos
+
+Cada `POST /infer` ejecuta el modelo de cero, tenga o no `session_id`:
+no existe ningún mecanismo que devuelva una respuesta guardada en vez de
+generar una nueva. Esto es intencional — un LLM normalmente debe poder
+regenerar (pedir "un número al azar" dos veces no debería dar lo mismo),
+y cachear por texto literal de prompt podría servir una respuesta vieja
+que ya no coincide con el resumen/contexto actualizado de la sesión.
+
+Lo que sí existe es una protección más chica y específica: si un pedido
+con `session_id` es **textualmente igual al último mensaje de esa
+sesión** y llegó hace menos de `DEDUPE_WINDOW_SECONDS` (10s por
+defecto), se asume que es un **reintento** (timeout de red, doble click
+del cliente) y se devuelve el job que ya se había creado para el
+original —sin crear un job ni un mensaje nuevos— marcado con
+`"deduplicated": true` en la respuesta. Pasada esa ventana, o con un
+texto distinto, se ejecuta de cero con total normalidad. Ver
+`_find_recent_duplicate()` en `server/main.py` y los tests
+`test_immediate_retry_with_same_prompt_returns_same_job`,
+`test_different_prompt_in_same_session_is_not_deduplicated` y
+`test_same_prompt_outside_dedupe_window_runs_again`.
+
 ### Cómo probarlo
 
 **A) Automático** (no necesita GPU ni Ollama — simula nodos falsos):

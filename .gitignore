@@ -3,6 +3,8 @@ __pycache__/
 *.pyc
 *.pyo
 *.db
+*.db-shm
+*.db-wal
 .env
 agent/agent_config.json
 *.safetensors

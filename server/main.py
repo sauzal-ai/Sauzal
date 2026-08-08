@@ -212,6 +212,35 @@ def _lock_for_session(session_id: str) -> threading.Lock:
         return lock
 
 
+# Ventana en la que se considera que un pedido a /infer con el mismo
+# session_id y el mismo texto de prompt es un REINTENTO (timeout de red,
+# doble click del cliente) en vez de una pregunta nueva. Esto NO es un
+# cache de respuestas: pasada la ventana, la misma pregunta se ejecuta
+# de cero otra vez, con normalidad (un LLM puede responder distinto la
+# segunda vez, y eso es lo esperado).
+DEDUPE_WINDOW_SECONDS = 10
+
+def _find_recent_duplicate(conn, session_id: str, prompt: str):
+    """
+    Si el ULTIMO mensaje de usuario de esta sesion es textualmente igual
+    a `prompt` y se guardo hace menos de `DEDUPE_WINDOW_SECONDS`, devuelve
+    el job de chat mas reciente de esa sesion (el que ese mensaje disparo)
+    en vez de None -- /infer usa esto para evitar crear un job Y un
+    mensaje duplicados cuando el cliente reintenta el mismo pedido.
+    """
+    cutoff = time.time() - DEDUPE_WINDOW_SECONDS
+    last_msg = conn.execute("""
+      SELECT * FROM messages WHERE session_id=? AND role='user'
+      ORDER BY created_at DESC LIMIT 1
+    """, (session_id,)).fetchone()
+    if not last_msg or last_msg["content"] != prompt or last_msg["created_at"] < cutoff:
+        return None
+    return conn.execute("""
+      SELECT job_id, assigned_node, status FROM jobs
+      WHERE session_id=? AND kind='chat' ORDER BY created_at DESC LIMIT 1
+    """, (session_id,)).fetchone()
+
+
 def _pick_available_node(conn, node_hint: str | None = None):
     """
     Elige un nodo disponible (online, no pausado, no ocupado) para
@@ -689,10 +718,30 @@ def infer(req: Infer, request: Request):
     contexto incoherente. Los pedidos stateless (sin session_id) y los
     de sesiones DISTINTAS no comparten lock: siguen ejecutandose en
     paralelo sin esperarse entre si.
+
+    Reintentos: si el pedido tiene `session_id` y es textualmente IGUAL
+    al ultimo mensaje de esa sesion, mandado hace menos de
+    `DEDUPE_WINDOW_SECONDS`, se asume que es un reintento (timeout de
+    red, doble click) y se devuelve el job que ya se creo para el
+    original, SIN crear un job ni un mensaje nuevos (ver
+    `_find_recent_duplicate()`). Esto no es un cache de respuestas: la
+    misma pregunta fuera de esa ventana se ejecuta de cero, como
+    cualquier otra.
     """
     now=time.time()
     lock = _lock_for_session(req.session_id) if req.session_id else nullcontext()
     with lock, db() as conn:
+        if req.session_id:
+            session = memory.get_session(conn, req.session_id)
+            if not session:
+                raise HTTPException(404, "Session not found")
+            dup = _find_recent_duplicate(conn, req.session_id, req.prompt)
+            if dup:
+                return {
+                    "job_id": dup["job_id"], "assigned_node": dup["assigned_node"],
+                    "status": dup["status"], "deduplicated": True,
+                }
+
         node = _pick_available_node(conn, req.node)
         if not node:
             raise HTTPException(503,"No available Sauzal nodes")
@@ -700,9 +749,6 @@ def infer(req: Infer, request: Request):
         final_prompt = req.prompt
         ctx_tokens=ctx_messages=ctx_hits=None
         if req.session_id:
-            session = memory.get_session(conn, req.session_id)
-            if not session:
-                raise HTTPException(404, "Session not found")
             if not _is_image_model(req.model):
                 final_prompt, metrics = memory.build_context(conn, req.session_id, req.prompt)
                 ctx_tokens = metrics["context_tokens_estimate"]

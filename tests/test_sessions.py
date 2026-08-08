@@ -314,3 +314,84 @@ def test_same_session_concurrent_requests_do_not_corrupt_history(client):
     assert "Mensaje concurrente numero 1" in user_msgs
     assert "Mensaje concurrente numero 2" in user_msgs
     assert len(user_msgs) == 2, "ningun mensaje deberia perderse ni pisarse"
+
+
+def test_immediate_retry_with_same_prompt_returns_same_job(client):
+    """
+    Si el cliente reintenta el mismo pedido (timeout de red, doble
+    click) -- mismo session_id, mismo texto, casi al instante -- el
+    servidor tiene que devolver el job que ya existia, sin crear un
+    segundo job ni duplicar el mensaje en el historial. Esto se prueba
+    a proposito SIN completar el primer job (el nodo sigue "busy"): si
+    el dedupe no funcionara, la segunda llamada fallaria con 503 por no
+    haber ningun nodo disponible.
+    """
+    node = _register_node(client, "node-dedupe")
+    _heartbeat(client, node)
+    session_id = client.post("/sessions", json={}).json()["session_id"]
+
+    r1 = client.post("/infer", json={
+        "model": "gemma3:4b", "session_id": session_id, "prompt": "Hola, como estas?",
+    })
+    assert r1.status_code == 200
+    job1 = r1.json()
+    assert not job1.get("deduplicated")
+
+    r2 = client.post("/infer", json={
+        "model": "gemma3:4b", "session_id": session_id, "prompt": "Hola, como estas?",
+    })
+    assert r2.status_code == 200
+    job2 = r2.json()
+
+    assert job2["job_id"] == job1["job_id"]
+    assert job2.get("deduplicated") is True
+
+    messages = client.get(f"/sessions/{session_id}/messages").json()["messages"]
+    user_msgs = [m for m in messages if m["role"] == "user"]
+    assert len(user_msgs) == 1, "no deberia haberse duplicado el mensaje"
+
+
+def test_different_prompt_in_same_session_is_not_deduplicated(client):
+    node = _register_node(client, "node-dedupe-diff")
+    _heartbeat(client, node)
+    session_id = client.post("/sessions", json={}).json()["session_id"]
+
+    r1 = client.post("/infer", json={
+        "model": "gemma3:4b", "session_id": session_id, "prompt": "Primera pregunta",
+    })
+    _complete_job(client, node, r1.json()["job_id"], "Respuesta 1")
+
+    _heartbeat(client, node)
+    r2 = client.post("/infer", json={
+        "model": "gemma3:4b", "session_id": session_id, "prompt": "Segunda pregunta, distinta",
+    })
+
+    assert r1.json()["job_id"] != r2.json()["job_id"]
+    assert not r2.json().get("deduplicated")
+
+
+def test_same_prompt_outside_dedupe_window_runs_again(client, monkeypatch):
+    """Pasada la ventana de deduplicacion, la misma pregunta se ejecuta
+    de cero -- esto NO es un cache de respuestas."""
+    import time as time_module
+
+    from server import main as server_main
+    monkeypatch.setattr(server_main, "DEDUPE_WINDOW_SECONDS", 0.05)
+
+    node = _register_node(client, "node-dedupe-window")
+    _heartbeat(client, node)
+    session_id = client.post("/sessions", json={}).json()["session_id"]
+
+    r1 = client.post("/infer", json={
+        "model": "gemma3:4b", "session_id": session_id, "prompt": "Que hora es?",
+    })
+    _complete_job(client, node, r1.json()["job_id"], "Respuesta 1")
+    time_module.sleep(0.15)
+
+    _heartbeat(client, node)
+    r2 = client.post("/infer", json={
+        "model": "gemma3:4b", "session_id": session_id, "prompt": "Que hora es?",
+    })
+
+    assert r1.json()["job_id"] != r2.json()["job_id"]
+    assert not r2.json().get("deduplicated")
