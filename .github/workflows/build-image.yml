@@ -1,14 +1,40 @@
+# ============================================================
+# Sauzal · CI de build y publicacion de la imagen del nodo GPU
+# ============================================================
+#
+# Este workflow reemplaza el "docker build" manual: cada vez que se
+# modifica el Dockerfile, el entrypoint, el codigo del agente, o este
+# mismo archivo, GitHub reconstruye la imagen en sus propios servidores
+# (gratis para repos publicos, con limite generoso de minutos) y la
+# publica en Docker Hub. Asi nunca hace falta tener Docker corriendo en
+# una PC local para actualizar la imagen que usan los Pods de RunPod.
+#
+# Requiere dos secrets configurados en GitHub (Settings -> Secrets and
+# variables -> Actions): DOCKERHUB_USERNAME y DOCKERHUB_TOKEN (un access
+# token generado en Docker Hub, no la contraseña de la cuenta).
+#
+# Riesgo conocido: la imagen final pesa 20GB+ (por los modelos horneados
+# en el Dockerfile: FLUX + gemma3:4b), y el runner gratuito de GitHub
+# Actions tiene poco disco libre por defecto (~14GB). Por eso el paso
+# "Liberar espacio en el runner" es critico -- sin el, el build falla por
+# falta de espacio. Los pasos "Espacio disponible" son solo de diagnostico,
+# para poder ver en los logs cuanto queda libre en cada etapa si algo
+# vuelve a fallar por este motivo.
+
 name: Build & Push Docker image
 
 on:
   push:
     branches: [main]
     paths:
+      # Solo se dispara si cambia algo que realmente afecta la imagen.
+      # server/ y client/ NO estan listados a proposito: no forman parte
+      # del contenedor, y no tiene sentido gastar minutos de CI por eso.
       - Dockerfile
       - entrypoint.sh
       - agent/**
       - .github/workflows/build-image.yml
-  workflow_dispatch:
+  workflow_dispatch:   # permite tambien dispararlo a mano desde la pestaña Actions
 
 jobs:
   build-and-push:
@@ -20,6 +46,9 @@ jobs:
       - name: Espacio disponible (antes de limpiar)
         run: df -h /
 
+      # Libera espacio preinstalado en el runner que no se usa para este
+      # build (Android SDK, .NET, Haskell, paquetes grandes, imagenes
+      # Docker de base, swap) para dejar lugar a la imagen de 20GB+.
       - name: Liberar espacio en el runner
         uses: jlumbroso/free-disk-space@main
         with:
@@ -40,9 +69,13 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
+      # Buildx habilita el motor de build moderno de Docker (BuildKit),
+      # que necesita la action build-push-action de abajo.
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
+      # Compila la imagen (usando el Dockerfile de la raiz del repo) y la
+      # sube directo a Docker Hub como "<usuario>/sauzal-node:latest".
       - name: Build y push
         uses: docker/build-push-action@v6
         with:
@@ -50,6 +83,9 @@ jobs:
           push: true
           tags: ${{ secrets.DOCKERHUB_USERNAME }}/sauzal-node:latest
 
+      # if: always() -> corre incluso si el build de arriba fallo, para
+      # poder ver en el log cuanto espacio quedaba justo en el momento
+      # del fallo (util para diagnosticar errores de "no space left").
       - name: Espacio disponible (despues del build)
         if: always()
         run: df -h /

@@ -1,8 +1,11 @@
 """
 Sauzal · backend de imagen (ComfyUI)
 
-Modulo del agente. No expone puertos: el agente lo llama cuando el server
-le asigna un job cuyo modelo es de imagen.
+Modulo del agente. No expone puertos propios: el agente (agent.py) lo
+importa y lo llama cuando el servidor le asigna un job cuyo modelo es de
+imagen (ver `is_image_model`). Habla con ComfyUI, que corre localmente en
+esta misma maquina en el puerto 8188 (arrancado por entrypoint.sh en el
+Pod, o manualmente si se prueba en una PC).
 
 Los jobs de imagen viajan por la misma tabla que los de texto. El campo
 prompt admite dos formas:
@@ -12,6 +15,21 @@ prompt admite dos formas:
 
 El resultado es un JSON con el PNG en base64, para que entre en la
 columna result sin cambiar el esquema de la base.
+
+Como funciona la generacion, paso a paso (funcion `generate`):
+    1. `parse_request`  -> normaliza el prompt (texto o JSON) a un dict
+                           con width/height/steps/seed/batch_size validos.
+    2. `build_workflow` -> toma la plantilla de workflow exportada de
+                           ComfyUI (workflow_flux_schnell.json) y le
+                           inyecta esos valores en los nodos correctos.
+    3. `_queue`         -> manda el workflow armado a la API de ComfyUI
+                           (POST /prompt), que lo encola y devuelve un
+                           prompt_id para hacerle seguimiento.
+    4. `_wait`          -> hace polling a GET /history/{prompt_id} hasta
+                           que ComfyUI marque la generacion como
+                           terminada (o falle, o se pase el timeout).
+    5. `_fetch`         -> descarga el/los PNG generados con GET /view.
+    6. Se devuelve todo como JSON con las imagenes en base64.
 """
 
 from __future__ import annotations
@@ -25,23 +43,29 @@ from pathlib import Path
 
 import requests
 
+# ComfyUI corre local, en el mismo host/contenedor que este agente.
 COMFY = "http://127.0.0.1:8188"
+# Plantilla de workflow exportada desde la UI de ComfyUI (Workflow -> Export API).
 WORKFLOW = Path(__file__).with_name("workflow_flux_schnell.json")
 
 # IDs de nodo del workflow exportado con Workflow -> Export (API).
 # Si reexportas despues de agregar o borrar nodos, revisa que sigan siendo estos.
-NODE_POSITIVE = "6"
-NODE_LATENT = "27"
-NODE_SAMPLER = "31"
-NODE_SAVE = "9"
+NODE_POSITIVE = "6"   # nodo CLIPTextEncode: donde va el prompt positivo
+NODE_LATENT = "27"    # nodo EmptyLatentImage: tamaño/batch de la imagen
+NODE_SAMPLER = "31"   # nodo KSampler (o similar): seed y steps
+NODE_SAVE = "9"       # nodo SaveImage: prefijo del nombre de archivo
 
 MODEL_NAME = "flux1-schnell-fp8"
-TIMEOUT = 600
-POLL = 0.5
+TIMEOUT = 600   # segundos maximos a esperar que termine una generacion
+POLL = 0.5      # segundos entre cada chequeo de /history mientras se espera
 
 
 def available() -> bool:
-    """True si este nodo puede generar imagenes."""
+    """
+    True si este nodo puede generar imagenes: necesita que exista el
+    archivo de workflow Y que ComfyUI este corriendo y responda. Se usa
+    en agent.py para decidir si anunciar el backend "comfyui" como activo.
+    """
     if not WORKFLOW.exists():
         return False
     try:
@@ -52,16 +76,29 @@ def available() -> bool:
 
 
 def models() -> list[str]:
+    """Lista de modelos de imagen disponibles (hoy, siempre uno solo:
+    MODEL_NAME) si `available()` es True, o vacia si no."""
     return [MODEL_NAME] if available() else []
 
 
 def is_image_model(model: str) -> bool:
+    """
+    Heuristica para decidir, a partir del nombre de modelo pedido en el
+    job, si hay que enrutarlo a ComfyUI (imagen) en vez de a Ollama
+    (texto). Reconoce por prefijo: flux*, sdxl*, sauzal-image*.
+    """
     m = (model or "").lower()
     return m.startswith("flux") or m.startswith("sdxl") or m.startswith("sauzal-image")
 
 
 def busy() -> bool:
-    """ComfyUI procesa de a uno. Sirve para no encolar a ciegas."""
+    """
+    True si ComfyUI ya tiene algo corriendo o encolado. ComfyUI procesa
+    de a un workflow por vez, asi que esto sirve para evitar mandar un
+    segundo pedido "a ciegas" mientras el anterior todavia esta en curso
+    (no se usa actualmente en el flujo principal de agent.py, queda
+    disponible como utilidad).
+    """
     try:
         q = requests.get(f"{COMFY}/queue", timeout=5).json()
         return bool(q.get("queue_running")) or bool(q.get("queue_pending"))
@@ -70,7 +107,20 @@ def busy() -> bool:
 
 
 def parse_request(prompt: str) -> dict:
-    """El prompt puede ser texto plano o un JSON con parametros."""
+    """
+    El prompt puede ser texto plano o un JSON con parametros. Devuelve
+    siempre un dict con valores validos y acotados a rangos seguros:
+
+    - width/height: redondeados a multiplos de 16 (FLUX trabaja en
+      latentes de 16px; un valor no alineado da errores opacos de
+      ComfyUI) y limitados a [256, 2048].
+    - steps: limitado a [1, 16] (FLUX-schnell esta pensado para pocos
+      pasos; mas de eso no mejora la calidad y solo hace mas lento).
+    - batch_size: limitado a [1, 4].
+
+    Si el JSON es invalido o no trae "prompt", se cae de nuevo a
+    interpretar todo el string original como prompt de texto plano.
+    """
     req = {
         "prompt": prompt,
         "width": 1024,
@@ -105,7 +155,15 @@ def parse_request(prompt: str) -> dict:
 
 
 def build_workflow(req: dict, seed: int, job_id: str) -> dict:
-    """Copia profunda de la plantilla con los valores del pedido inyectados."""
+    """
+    Copia profunda de la plantilla (WORKFLOW) con los valores del pedido
+    inyectados en los nodos correspondientes (ver las constantes NODE_*
+    arriba). Cada llamada relee el JSON de disco, asi que no hay estado
+    compartido entre generaciones concurrentes.
+
+    El nombre de archivo de salida incluye el job_id para poder
+    encontrarlo despues entre los outputs de ComfyUI sin colisiones.
+    """
     wf = json.loads(WORKFLOW.read_text(encoding="utf-8"))
 
     for node in (NODE_POSITIVE, NODE_LATENT, NODE_SAMPLER, NODE_SAVE):
@@ -127,6 +185,17 @@ def build_workflow(req: dict, seed: int, job_id: str) -> dict:
 
 
 def _queue(workflow: dict, client_id: str) -> str:
+    """
+    Manda el workflow armado a la API de ComfyUI (POST /prompt) para que
+    lo encole. Devuelve el `prompt_id` que ComfyUI asigna, necesario para
+    despues consultar el progreso/resultado en `_wait`.
+
+    Distingue dos tipos de fallo:
+    - HTTP 400: ComfyUI rechazo el workflow (parametros invalidos para
+      algun nodo) -> se levanta con el detalle que manda ComfyUI.
+    - "node_errors" en la respuesta: el workflow se acepto sintacticamente
+      pero algun nodo especifico tiene un error de configuracion.
+    """
     r = requests.post(
         f"{COMFY}/prompt",
         json={"prompt": workflow, "client_id": client_id},
@@ -150,6 +219,16 @@ def _queue(workflow: dict, client_id: str) -> str:
 
 
 def _wait(prompt_id: str) -> list[dict]:
+    """
+    Hace polling a GET /history/{prompt_id} cada POLL segundos hasta que
+    ComfyUI reporte que la generacion termino. Tres desenlaces posibles:
+
+    1. Aparecen imagenes de salida -> se devuelven sus referencias
+       (filename/subfolder/type), listas para pasarle a `_fetch`.
+    2. ComfyUI marca la ejecucion como "error" -> se levanta con los
+       mensajes de error que haya devuelto.
+    3. Se cumple el TIMEOUT sin ninguna de las anteriores -> TimeoutError.
+    """
     deadline = time.monotonic() + TIMEOUT
 
     while time.monotonic() < deadline:
@@ -178,6 +257,8 @@ def _wait(prompt_id: str) -> list[dict]:
 
 
 def _fetch(ref: dict) -> bytes:
+    """Descarga los bytes de una imagen generada, usando la referencia
+    (filename/subfolder/type) que devolvio `_wait`, via GET /view."""
     r = requests.get(
         f"{COMFY}/view",
         params={
@@ -192,7 +273,13 @@ def _fetch(ref: dict) -> bytes:
 
 
 def generate(model: str, prompt: str) -> str:
-    """Genera y devuelve un JSON serializado, listo para la columna result."""
+    """
+    Punto de entrada publico del modulo (lo llama agent.py). Orquesta
+    todo el flujo: parsear el pedido, armar el workflow, encolarlo,
+    esperar a que termine, bajar las imagenes resultantes, y devolver
+    todo como un JSON serializado (con las imagenes en base64) listo
+    para guardarse tal cual en la columna `result` del servidor.
+    """
     started = time.monotonic()
     req = parse_request(prompt)
     job_id = uuid.uuid4().hex[:12]

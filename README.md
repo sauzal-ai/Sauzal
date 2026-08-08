@@ -1,5 +1,9 @@
 # Sauzal PoC 0.2
 
+Para una explicación completa de la arquitectura (qué hace cada programa,
+cómo se relacionan, qué corre dónde, y el detalle de la base de datos),
+ver [`docs/ARQUITECTURA.md`](docs/ARQUITECTURA.md).
+
 Prueba de inferencia real:
 
 ```text

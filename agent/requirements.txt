@@ -1,1 +1,6 @@
+# Dependencias del AGENTE (agent.py + comfy.py). Solo necesita `requests`
+# para hablar HTTP con el servidor, con Ollama (127.0.0.1:11434) y con
+# ComfyUI (127.0.0.1:8188) -- no expone ninguna API propia, por eso no
+# hace falta fastapi/uvicorn aca (esos van en el requirements.txt de la
+# raiz, que usan server/ y client/).
 requests==2.32.4
