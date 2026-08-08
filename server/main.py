@@ -70,13 +70,14 @@ Limitaciones conocidas (ver README, seccion "No usar en produccion")
 from __future__ import annotations
 import html, ipaddress, json, os, sqlite3, threading, time, urllib.parse, uuid
 from contextlib import contextmanager, nullcontext
+from datetime import datetime
 from pathlib import Path
 import requests
 from fastapi import FastAPI, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from pydantic import BaseModel, Field
 
-from . import memory
+from . import memory, tasks
 
 # Base de datos SQLite, vive al lado de este archivo (server/sauzal.db) por
 # defecto. Configurable via SAUZAL_DB_PATH para que los tests (ver tests/)
@@ -212,6 +213,20 @@ def _lock_for_session(session_id: str) -> threading.Lock:
         return lock
 
 
+# Mismo patron que _lock_for_session, pero para tareas compuestas: evita
+# que dos subtareas de la MISMA tarea que terminan casi juntas disparen
+# la agregacion/finalizacion dos veces (ver tasks.on_subtask_completed()).
+_task_locks_guard = threading.Lock()
+_task_locks: dict[str, threading.Lock] = {}
+
+def _lock_for_task(task_id: str) -> threading.Lock:
+    with _task_locks_guard:
+        lock = _task_locks.get(task_id)
+        if lock is None:
+            lock = _task_locks[task_id] = threading.Lock()
+        return lock
+
+
 # Ventana en la que se considera que un pedido a /infer con el mismo
 # session_id y el mismo texto de prompt es un REINTENTO (timeout de red,
 # doble click del cliente) en vez de una pregunta nueva. Esto NO es un
@@ -327,6 +342,13 @@ def startup():
         location      -- "Ciudad, Pais" resuelto de ip_address via
                          geolocate() (ver esa funcion), o NULL si la IP
                          es privada/LAN o no se pudo resolver
+        registered_at -- timestamp (epoch) de cuando se registro este
+                         nodo por primera vez. A diferencia de
+                         `last_seen` (que se actualiza en cada
+                         heartbeat), este NUNCA cambia despues del
+                         registro -- sirve para saber "hace cuanto es
+                         parte de la red" ademas de "hace cuanto se vio
+                         por ultima vez"
 
     Tabla `jobs`: un registro por cada pedido de inferencia.
         job_id             -- UUID (PK)
@@ -375,7 +397,61 @@ def startup():
                               message_id que este resumen puntual va a cubrir;
                               al volver el resultado, esos mensajes se marcan
                               summarized=1 y el texto va a sessions.summary
+        task_id            -- si este job es una SUBTAREA de una tarea
+                              compuesta (ver Tabla `tasks` y server/tasks.py),
+                              a que tarea pertenece. NULL en jobs sueltos
+                              (los de siempre, /infer sin descomponer nada)
+        depends_on         -- JSON con los job_id de otras subtareas de la
+                              MISMA tarea que tienen que terminar antes de
+                              que esta pueda ejecutarse (para pipelines).
+                              Mientras falten, status='blocked' y no es
+                              elegible ni para /infer ni para /agent/pull
+        requires           -- JSON con requisitos de capacidades que tiene
+                              que cumplir el nodo que la ejecute (ej:
+                              {"service":"comfyui"} o {"model":"flux..."}).
+                              NULL si cualquier nodo disponible sirve
+        subtask_key        -- etiqueta corta que le puso el cliente a esta
+                              subtarea puntual (ej: "parte_1") para poder
+                              identificarla en el resultado agregado sin
+                              depender del job_id (UUID) crudo
+        retry_count        -- cuantas veces se reintento esta subtarea en
+                              OTRO nodo tras fallar (ver server/tasks.py).
+                              0 en jobs sueltos y en el primer intento
         created_at / updated_at -- timestamps (epoch)
+
+        Valores nuevos de `status` para subtareas: 'blocked' (esperando
+        dependencias, todavia no elegible para ningun nodo) y 'cancelled'
+        (la tarea padre ya no la necesita -- ver "cancelacion" en
+        server/tasks.py; es un cancelado BLANDO: si el nodo ya la estaba
+        ejecutando, el resultado que mande mas tarde simplemente se ignora,
+        no hay forma de interrumpir a un agente a mitad de una inferencia).
+
+    Tabla `tasks`: una tarea compleja compuesta por varias subtareas (filas
+    de `jobs` con `task_id` apuntando a esta). Implementa "Task
+    Decomposition + Aggregation" -- ver server/tasks.py para toda la logica
+    de descomposicion, dependencias, agregacion, cancelacion y reintentos.
+
+        task_id       -- UUID (PK), lo devuelve POST /tasks
+        session_id    -- sesion de conversacion asociada, o NULL
+        tenant_id     -- reservado para multi-tenant futuro (igual que en
+                         `sessions`), hoy siempre NULL
+        mode          -- 'batch' | 'fan_out' | 'pipeline' | 'map_reduce' |
+                         'first_success' | 'consensus' -- define como se
+                         ejecutan las subtareas y, por defecto, como se
+                         agregan (ver server/tasks.py::DEFAULT_AGGREGATION)
+        aggregation   -- estrategia de agregacion efectivamente usada
+                         ('collect_all' | 'first_success' | 'concat' |
+                         'vote' | 'llm_synthesize'). Se puede pisar el
+                         default del `mode` al crear la tarea
+        status        -- 'running' -> 'aggregating' -> 'completed' |
+                         'failed' | 'cancelled'
+        policy        -- JSON con limites: max_parallel, max_nodes,
+                         max_time_s, max_cost, max_retries (todos opcionales)
+        result        -- JSON con el resultado final agregado (solo si
+                         status='completed')
+        error         -- texto del error, si status='failed'
+        created_at / updated_at / completed_at -- timestamps (epoch);
+                         completed_at queda NULL hasta que la tarea termina
 
     Tabla `sessions` y `messages`: implementan la memoria de conversacion
     (ver server/memory.py para el detalle completo de la logica). Un
@@ -439,6 +515,11 @@ def startup():
           trivial INTEGER DEFAULT 0, token_estimate INTEGER,
           summarized INTEGER DEFAULT 0);
         CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, created_at);
+        CREATE TABLE IF NOT EXISTS tasks(
+          task_id TEXT PRIMARY KEY, session_id TEXT, tenant_id TEXT,
+          mode TEXT, aggregation TEXT, status TEXT, policy TEXT,
+          result TEXT, error TEXT,
+          created_at REAL, updated_at REAL, completed_at REAL);
         """)
         existing_job_cols = {r["name"] for r in conn.execute("PRAGMA table_info(jobs)").fetchall()}
         for column, coltype in (
@@ -457,9 +538,19 @@ def startup():
             ("context_messages_used", "INTEGER"),
             ("context_semantic_hits", "INTEGER"),
             ("summarize_message_ids", "TEXT"),
+            ("task_id", "TEXT"),
+            ("depends_on", "TEXT"),
+            ("requires", "TEXT"),
+            ("subtask_key", "TEXT"),
+            ("retry_count", "INTEGER DEFAULT 0"),
         ):
             if column not in existing_job_cols:
                 conn.execute(f"ALTER TABLE jobs ADD COLUMN {column} {coltype}")
+        # Recien aca es seguro crear el indice sobre task_id: si la
+        # columna se acaba de agregar arriba con ALTER TABLE, hacerlo
+        # antes (antes de la migracion) rompe en bases nuevas donde la
+        # tabla `jobs` original todavia no la tenia.
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_task ON jobs(task_id)")
 
         existing_node_cols = {r["name"] for r in conn.execute("PRAGMA table_info(nodes)").fetchall()}
         for column, coltype in (
@@ -469,9 +560,14 @@ def startup():
             ("latency_ms", "REAL"),
             ("ip_address", "TEXT"),
             ("location", "TEXT"),
+            ("registered_at", "REAL"),
         ):
             if column not in existing_node_cols:
                 conn.execute(f"ALTER TABLE nodes ADD COLUMN {column} {coltype}")
+        # Para nodos que ya existian de antes de esta columna, se usa
+        # `last_seen` como aproximacion de cuando se registraron (mejor
+        # que dejarlo en NULL para siempre).
+        conn.execute("UPDATE nodes SET registered_at=last_seen WHERE registered_at IS NULL")
 
 
 # ----------------------------------------------------------------------
@@ -589,10 +685,12 @@ def register(req: Register, request: Request):
     node_id, token = str(uuid.uuid4()), str(uuid.uuid4())
     ip = client_ip(request)
     location = geolocate(ip)
+    now = time.time()
     with db() as conn:
         conn.execute(
-            "INSERT INTO nodes(node_id,name,token,status,last_seen,capabilities,paused,ip_address,location) VALUES(?,?,?,?,?,?,?,?,?)",
-            (node_id, req.name, token, "available", time.time(), req.capabilities, int(req.paused), ip, location)
+            """INSERT INTO nodes(node_id,name,token,status,last_seen,capabilities,paused,ip_address,location,registered_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?)""",
+            (node_id, req.name, token, "available", now, req.capabilities, int(req.paused), ip, location, now)
         )
     return {"node_id":node_id,"token":token}
 
@@ -779,27 +877,65 @@ def infer(req: Infer, request: Request):
 def pull(req: Auth):
     """
     El agente llama esto en cada ciclo de heartbeat para preguntar si
-    tiene trabajo asignado. Busca el job "queued" mas antiguo asignado a
-    ESE node_id (podria haber mas de uno en cola si se le mandaron varios
-    seguidos), lo marca "running" y se lo devuelve.
+    tiene trabajo asignado. Primero busca el job "queued" mas antiguo
+    asignado DIRECTAMENTE a ese node_id (el caso normal: un /infer suelto
+    que ya lo eligio a el especificamente), lo marca "running" y se lo
+    devuelve.
 
-    Si no hay nada, devuelve {"job": None} y el agente simplemente espera
-    al proximo ciclo (ver el `time.sleep(2)` en agent.py).
+    Si no tiene nada asignado directamente, prueba reclamar una subtarea
+    del pool compartido de una tarea compuesta (`tasks.claim_subtask()`)
+    -- subtareas de batch/fan-out/etc que no tienen un nodo especifico en
+    mente, listas para que las tome cualquier nodo disponible que cumpla
+    sus `requires`. Esto es lo que permite repartir automaticamente N
+    subtareas entre los nodos que haya online en cada momento.
+
+    Si no hay nada de ningun tipo, devuelve {"job": None} y el agente
+    simplemente espera al proximo ciclo (ver el `time.sleep(2)` en
+    agent.py). El agente no distingue entre los dos casos: para el,
+    siempre es "un job de texto para ejecutar".
     """
     with db() as conn:
-        authenticate(conn, req.node_id, req.token)
+        node = authenticate(conn, req.node_id, req.token)
         job=conn.execute("""
           SELECT job_id,model,prompt FROM jobs
           WHERE assigned_node=? AND status='queued'
           ORDER BY created_at LIMIT 1
         """,(req.node_id,)).fetchone()
-        if not job:
-            return {"job":None}
-        conn.execute(
-            "UPDATE jobs SET status='running',updated_at=? WHERE job_id=?",
-            (time.time(),job["job_id"])
-        )
-    return {"job":dict(job)}
+        if job:
+            conn.execute(
+                "UPDATE jobs SET status='running',updated_at=? WHERE job_id=?",
+                (time.time(),job["job_id"])
+            )
+            return {"job":dict(job)}
+
+        claimed = tasks.claim_subtask(conn, req.node_id, node["capabilities"])
+        if claimed:
+            return {"job":claimed}
+    return {"job":None}
+
+
+def _task_result_text(task_result_json: str | None) -> str | None:
+    """
+    Extrae un texto representativo del resultado final de una tarea
+    compuesta, para guardarlo como mensaje de la sesion cuando
+    corresponda. Distintas estrategias de agregacion devuelven formas
+    distintas de resultado (ver tasks.py::_aggregate_and_finalize()):
+    la mayoria trae un campo "response" directo; 'collect_all' en cambio
+    trae un dict "results" (una respuesta por subtarea), que se aplana a
+    texto como "key: respuesta" por linea. Devuelve None si no hay nada
+    representable como texto (ej: la tarea fallo).
+    """
+    if not task_result_json:
+        return None
+    try:
+        result = json.loads(task_result_json)
+    except json.JSONDecodeError:
+        return None
+    if result.get("response"):
+        return result["response"]
+    if result.get("results"):
+        return "\n".join(f"{k}: {v}" for k, v in result["results"].items())
+    return None
 
 
 def _maybe_enqueue_summary(conn, session_id: str, model: str) -> None:
@@ -875,11 +1011,19 @@ def result(job_id: str, req: Result):
     usa /infer -- asi dos resultados que llegan casi juntos para la
     MISMA sesion (por ejemplo, si el cliente disparo dos pedidos de esa
     sesion en paralelo) no se pisan al guardar los mensajes.
+
+    Si el job es una SUBTAREA de una tarea compuesta (`task_id` seteado,
+    ver server/tasks.py), se dispara ademas `tasks.on_subtask_completed()`
+    bajo el lock de esa tarea. Las subtareas individuales NO actualizan
+    la memoria de la sesion por si solas -- solo lo hace el resultado
+    AGREGADO final, y unicamente en el momento exacto en que la tarea
+    termina (se detecta porque `on_subtask_completed()` devuelve la fila
+    de la tarea recien finalizada, no None).
     """
     with db() as conn:
         authenticate(conn, req.node_id, req.token)
         job = conn.execute(
-            "SELECT model,session_id,kind,summarize_message_ids FROM jobs WHERE job_id=?", (job_id,)
+            "SELECT * FROM jobs WHERE job_id=?", (job_id,)
         ).fetchone()
         status="completed" if req.success else "failed"
         conn.execute("""
@@ -890,7 +1034,7 @@ def result(job_id: str, req: Result):
             (time.time(),req.node_id)
         )
 
-    if req.success and job and job["session_id"]:
+    if req.success and job and job["session_id"] and not job["task_id"]:
         with _lock_for_session(job["session_id"]), db() as conn:
             try:
                 response_text = json.loads(req.result).get("response") if req.result else None
@@ -911,6 +1055,20 @@ def result(job_id: str, req: Result):
                 else:
                     memory.add_message(conn, job["session_id"], "assistant", response_text)
                     _maybe_enqueue_summary(conn, job["session_id"], job["model"])
+
+    if job and job["task_id"]:
+        try:
+            response_text = json.loads(req.result).get("response") if req.result else None
+        except json.JSONDecodeError:
+            response_text = None
+        with _lock_for_task(job["task_id"]), db() as conn:
+            fresh_job = conn.execute("SELECT * FROM jobs WHERE job_id=?", (job_id,)).fetchone()
+            finalized = tasks.on_subtask_completed(conn, fresh_job, response_text)
+            if finalized and finalized["session_id"] and finalized["status"] == "completed":
+                text = _task_result_text(finalized["result"])
+                if text:
+                    with _lock_for_session(finalized["session_id"]):
+                        memory.add_message(conn, finalized["session_id"], "assistant", text)
     return {"ok":True}
 
 
@@ -1008,6 +1166,117 @@ def delete_session(session_id: str):
 
 
 # ============================================================
+# Tareas compuestas (Task Decomposition + Aggregation)
+# ============================================================
+#
+# Estos cuatro endpoints son la interfaz publica de server/tasks.py: le
+# permiten a un cliente pedir una tarea compleja compuesta por varias
+# subtareas (potencialmente con dependencias entre si), que se reparten
+# entre los nodos disponibles EN CADA MOMENTO y se combinan en un
+# resultado final. Ver el docstring de tasks.py para el detalle completo
+# del modelo, las estrategias de agregacion, y por que el agente no
+# necesita ningun cambio para soportar esto.
+#
+# El uso tipico es identico al de /infer: se crea la tarea, y se hace
+# polling de GET /tasks/{id} hasta que status sea 'completed' | 'failed'
+# | 'cancelled'. `GET /tasks/{id}/subtasks` da la trazabilidad completa
+# de que nodo ejecuto cada parte.
+
+class SubtaskSpec(BaseModel):
+    """Una subtarea dentro del body de POST /tasks."""
+    key: str = Field(min_length=1)          # identificador corto, unico dentro de la tarea
+    model: str = "gemma3:4b"
+    prompt: str = Field(min_length=1)       # puede tener {{otra_key.result}} si depende de otra (pipeline)
+    depends_on: list[str] = []              # keys de otras subtareas de ESTA MISMA tarea
+    requires: dict | None = None            # ej: {"service":"comfyui"} o {"model":"flux1-schnell-fp8"}
+
+class TaskCreate(BaseModel):
+    """Body de POST /tasks."""
+    mode: str                               # 'batch'|'fan_out'|'pipeline'|'map_reduce'|'first_success'|'consensus'
+    subtasks: list[SubtaskSpec]
+    session_id: str | None = None
+    aggregation: str | None = None          # pisa el default de `mode` si se especifica
+    policy: dict | None = None              # max_parallel/max_nodes/max_time_s/max_cost/max_retries (todos opcionales)
+
+
+@app.post("/tasks")
+def create_task(req: TaskCreate):
+    """
+    Crea una tarea compuesta y todas sus subtareas de una. Devuelve el
+    `task_id` y el mapeo {key: job_id} de cada subtarea, para poder
+    seguirlas individualmente si hace falta.
+
+    Las subtareas sin `depends_on` quedan disponibles de inmediato para
+    que cualquier nodo las reclame (`tasks.claim_subtask()`, via
+    `/agent/pull`); las que dependen de otras esperan bloqueadas hasta
+    que esas terminen.
+    """
+    if req.session_id:
+        with db() as conn:
+            if not memory.get_session(conn, req.session_id):
+                raise HTTPException(404, "Session not found")
+    try:
+        with db() as conn:
+            task_id, key_to_job_id = tasks.create_task(
+                conn, req.mode,
+                [s.model_dump() for s in req.subtasks],
+                session_id=req.session_id, aggregation=req.aggregation, policy=req.policy,
+            )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    return {"task_id": task_id, "subtasks": key_to_job_id}
+
+
+@app.get("/tasks/{task_id}")
+def get_task(task_id: str):
+    """
+    Estado de una tarea: modo, estrategia de agregacion, status,
+    resultado final (si ya termino) y metricas (subtareas, nodos
+    usados, exitos/fallos, reintentos, duraciones, tokens -- ver
+    `tasks.compute_metrics()`). Tambien chequea perezosamente si se paso
+    del `policy.max_time_s`: no hay ningun proceso de fondo corriendo,
+    asi que el timeout recien se aplica cuando algo consulta la tarea.
+    """
+    with db() as conn:
+        task = tasks.get_task(conn, task_id)
+        if not task:
+            raise HTTPException(404, "Task not found")
+        if tasks.check_timeout(conn, task):
+            task = tasks.get_task(conn, task_id)
+        metrics = tasks.compute_metrics(conn, task_id)
+    return {**dict(task), "metrics": metrics}
+
+
+@app.get("/tasks/{task_id}/subtasks")
+def get_task_subtasks(task_id: str):
+    """Lista completa de subtareas de una tarea, con el nombre del nodo
+    que ejecuto (o esta ejecutando) cada una -- la trazabilidad completa
+    de "que nodo hizo que parte" que pide el diseño."""
+    with db() as conn:
+        if not tasks.get_task(conn, task_id):
+            raise HTTPException(404, "Task not found")
+        subtasks = [dict(r) for r in conn.execute("""
+          SELECT jobs.*, nodes.name AS node_name FROM jobs
+          LEFT JOIN nodes ON nodes.node_id = jobs.assigned_node
+          WHERE jobs.task_id=? ORDER BY jobs.created_at ASC
+        """, (task_id,)).fetchall()]
+    return {"task_id": task_id, "subtasks": subtasks}
+
+
+@app.post("/tasks/{task_id}/cancel")
+def cancel_task(task_id: str):
+    """Cancela una tarea a pedido explicito del cliente: las subtareas
+    que no habian terminado quedan 'cancelled' (cancelacion blanda, ver
+    tasks.py -- un nodo que ya la estaba ejecutando no se puede
+    interrumpir a mitad de camino, solo se ignora su resultado)."""
+    with db() as conn:
+        ok = tasks.cancel_task(conn, task_id)
+    if not ok:
+        raise HTTPException(404, "Task not found or already finished")
+    return {"ok": True}
+
+
+# ============================================================
 # Panel de administracion
 # ============================================================
 #
@@ -1042,6 +1311,37 @@ def _ago(ts: float, now: float) -> str:
     if delta < 86400:
         return f"{int(delta/3600)}h"
     return f"{int(delta/86400)}d"
+
+
+def _fmt_dt(ts: float | None) -> str:
+    """
+    Formatea un timestamp epoch como fecha/hora completa, con precision
+    de milisegundos y zona horaria explicita -- ej: "2026-08-08
+    14:23:45.123 -0300". Usa la zona horaria LOCAL de la maquina donde
+    corre el servidor (`astimezone()` sin argumentos toma la del
+    sistema operativo); en un despliegue con el servidor en otro huso
+    horario que quien mira el panel, hay que tenerlo en cuenta -- por
+    eso el offset siempre se muestra explicito, para no depender de
+    "adivinar" en que zona esta parado el servidor.
+    """
+    if ts is None:
+        return "N/A"
+    dt = datetime.fromtimestamp(ts).astimezone()
+    return f"{dt.strftime('%Y-%m-%d %H:%M:%S')}.{dt.microsecond // 1000:03d} {dt.strftime('%z')}"
+
+
+def _when(ts: float | None, now: float) -> str:
+    """
+    HTML para mostrar un timestamp en el panel combinando las dos cosas
+    que hacen falta para "saber cuando se ejecuto cada cosa": el tiempo
+    relativo ("hace 5s", facil de escanear de un vistazo) arriba, y la
+    fecha/hora exacta con milisegundos y zona horaria (`_fmt_dt()`)
+    abajo, en texto mas chico. Reemplaza los usos de `_ago()` sueltos en
+    las tablas del panel donde antes solo se mostraba lo relativo.
+    """
+    if ts is None:
+        return "N/A"
+    return f'{_ago(ts, now)}<br><span class="ts">{_fmt_dt(ts)}</span>'
 
 
 def _fmt(value, suffix: str = "") -> str:
@@ -1109,7 +1409,8 @@ def _node_row(row: dict, now: float) -> str:
       <td>{disponibilidad}</td>
       <td>{html.escape(row["status"] or "")}</td>
       <td>{ip_display}</td>
-      <td>{_ago(row["last_seen"], now)}</td>
+      <td>{_when(row["last_seen"], now)}</td>
+      <td>{_when(row.get("registered_at"), now)}</td>
       <td>{html.escape(backends)}</td>
       <td class="actions">
         <form method="post" action="/admin/nodes/{row['node_id']}/{pause_action}">
@@ -1168,7 +1469,7 @@ def _job_row(row: dict, now: float) -> str:
       <td>{html.escape(node_label)}</td>
       <td title="tokens de entrada/salida">{tokens}</td>
       <td>{duration}</td>
-      <td>{_ago(row["created_at"], now)}</td>
+      <td>{_when(row["created_at"], now)}</td>
       <td class="actions">
         <form method="post" action="/admin/jobs/{row['job_id']}/delete" onsubmit="return confirm('¿Eliminar este trabajo?')">
           <button class="danger">Eliminar</button>
@@ -1199,7 +1500,7 @@ def _client_row(c: dict, now: float) -> str:
       <td>{_client_origin(c.get("client_user_agent"))}</td>
       <td>{html.escape(c.get("client_os") or "N/A")}</td>
       <td>{c["job_count"]}</td>
-      <td>{_ago(c["created_at"], now)}</td>
+      <td>{_when(c["created_at"], now)}</td>
     </tr>"""
 
 
@@ -1216,11 +1517,36 @@ def _session_row(s: dict, now: float) -> str:
       <td><a href="/admin/sessions/{s['session_id']}">{s['session_id'][:8]}…</a></td>
       <td>{s["message_count"]}</td>
       <td title="{html.escape(summary or '')}">{html.escape(summary_preview)}</td>
-      <td>{_ago(s["created_at"], now)}</td>
-      <td>{_ago(s["last_used_at"], now)}</td>
+      <td>{_when(s["created_at"], now)}</td>
+      <td>{_when(s["last_used_at"], now)}</td>
       <td class="actions">
         <form method="post" action="/admin/sessions/{s['session_id']}/delete" onsubmit="return confirm('¿Borrar esta sesion y toda su memoria?')">
           <button class="danger">Eliminar</button>
+        </form>
+      </td>
+    </tr>"""
+
+
+_TASK_STATUS_ICON = {
+    "running": "⚙️", "aggregating": "🧮", "completed": "✅", "failed": "❌", "cancelled": "🚫",
+}
+
+def _task_row(t: dict, now: float) -> str:
+    """Fila <tr> de una tarea compuesta para la tabla del panel.
+    `subtask_count`/`succeeded`/`failed` vienen de un COUNT agregado
+    aparte (ver admin_panel()), no de la tabla `tasks`."""
+    icon = _TASK_STATUS_ICON.get(t["status"], "")
+    return f"""
+    <tr>
+      <td><a href="/admin/tasks/{t['task_id']}">{t['task_id'][:8]}…</a></td>
+      <td>{html.escape(t["mode"] or "")}</td>
+      <td>{html.escape(t["aggregation"] or "")}</td>
+      <td>{icon} {html.escape(t["status"] or "")}</td>
+      <td>{t["subtask_count"]} ({t["succeeded"]}✅ {t["failed"]}❌)</td>
+      <td>{_when(t["created_at"], now)}</td>
+      <td class="actions">
+        <form method="post" action="/admin/tasks/{t['task_id']}/cancel" onsubmit="return confirm('¿Cancelar esta tarea?')">
+          <button class="danger">Cancelar</button>
         </form>
       </td>
     </tr>"""
@@ -1256,6 +1582,14 @@ def admin_panel():
           FROM sessions LEFT JOIN messages ON messages.session_id = sessions.session_id
           GROUP BY sessions.session_id ORDER BY sessions.last_used_at DESC
         """).fetchall()]
+        task_rows = [dict(r) for r in conn.execute("""
+          SELECT tasks.*,
+            SUM(CASE WHEN jobs.subtask_key IS NULL OR jobs.subtask_key != '__aggregate__' THEN 1 ELSE 0 END) AS subtask_count,
+            SUM(CASE WHEN jobs.status='completed' AND (jobs.subtask_key IS NULL OR jobs.subtask_key != '__aggregate__') THEN 1 ELSE 0 END) AS succeeded,
+            SUM(CASE WHEN jobs.status='failed' AND (jobs.subtask_key IS NULL OR jobs.subtask_key != '__aggregate__') THEN 1 ELSE 0 END) AS failed
+          FROM tasks LEFT JOIN jobs ON jobs.task_id = tasks.task_id
+          GROUP BY tasks.task_id ORDER BY tasks.created_at DESC
+        """).fetchall()]
 
     # Agrupa por nombre de cliente en Python (no en SQL) para quedarse con
     # los datos del job MAS RECIENTE de cada uno (la lista ya viene
@@ -1268,11 +1602,13 @@ def admin_panel():
     clients = list(clients_by_name.values())
 
     nodes_html = "".join(_node_row(n, now) for n in nodes) or \
-        "<tr><td colspan='8'>No hay nodos registrados todavia.</td></tr>"
+        "<tr><td colspan='9'>No hay nodos registrados todavia.</td></tr>"
     clients_html = "".join(_client_row(c, now) for c in clients) or \
         "<tr><td colspan='6'>Todavia no hay pedidos de ningun cliente.</td></tr>"
     sessions_html = "".join(_session_row(s, now) for s in sessions) or \
         "<tr><td colspan='6'>Todavia no hay sesiones de conversacion.</td></tr>"
+    tasks_html = "".join(_task_row(t, now) for t in task_rows) or \
+        "<tr><td colspan='7'>Todavia no hay tareas compuestas.</td></tr>"
     jobs_html = "".join(_job_row(j, now) for j in jobs) or \
         "<tr><td colspan='10'>No hay trabajos todavia.</td></tr>"
     online_count = sum(1 for n in nodes if now - n["last_seen"] < 30)
@@ -1298,15 +1634,17 @@ def admin_panel():
   button.danger:hover {{ background:#5c2020; border-color:#7a2a2a; }}
   a {{ color:#7fb0ff; }}
   .summary {{ color:#9aa0a6; font-size:0.9rem; }}
+  .ts {{ color:#7a7f87; font-size:0.72rem; white-space:nowrap; }}
 </style>
 </head>
 <body>
   <h1>Sauzal · Panel de administracion</h1>
-  <p class="summary">{len(nodes)} nodos registrados ({online_count} online) · {len(clients)} clientes distintos · {len(sessions)} sesiones de conversacion · {len(jobs)} trabajos mostrados (ultimos 200) · se actualiza sola cada 5s · click en un nombre para ver mas detalle</p>
+  <p class="summary">Hora del servidor: {_fmt_dt(now)} · todos los timestamps de este panel usan esta misma zona horaria</p>
+  <p class="summary">{len(nodes)} nodos registrados ({online_count} online) · {len(clients)} clientes distintos · {len(sessions)} sesiones de conversacion · {len(task_rows)} tareas compuestas · {len(jobs)} trabajos mostrados (ultimos 200) · se actualiza sola cada 5s · click en un nombre para ver mas detalle</p>
 
   <h2>Nodos</h2>
   <table>
-    <tr><th>Nombre</th><th>Online</th><th>Disponibilidad</th><th>Status</th><th>IP (ubicacion)</th><th>Ultimo heartbeat</th><th>Backends</th><th>Acciones</th></tr>
+    <tr><th>Nombre</th><th>Online</th><th>Disponibilidad</th><th>Status</th><th>IP (ubicacion)</th><th>Ultimo heartbeat</th><th>Registrado</th><th>Backends</th><th>Acciones</th></tr>
     {nodes_html}
   </table>
 
@@ -1320,6 +1658,12 @@ def admin_panel():
   <table>
     <tr><th>Session</th><th>Mensajes</th><th>Resumen</th><th>Creada hace</th><th>Ultimo uso hace</th><th>Acciones</th></tr>
     {sessions_html}
+  </table>
+
+  <h2>Tareas compuestas (Task Decomposition + Aggregation)</h2>
+  <table>
+    <tr><th>Task</th><th>Modo</th><th>Agregacion</th><th>Estado</th><th>Subtareas</th><th>Creada hace</th><th>Acciones</th></tr>
+    {tasks_html}
   </table>
 
   <h2>Trabajos</h2>
@@ -1392,7 +1736,7 @@ def admin_node_detail(node_id: str):
         <td><a href="/jobs/{j['job_id']}" target="_blank">{j['job_id'][:8]}…</a></td>
         <td>{html.escape(j['model'] or '')}</td>
         <td title="{html.escape(j['error'] or '')}">{html.escape((j['error'] or '')[:80])}</td>
-        <td>{_ago(j['created_at'], now)}</td>
+        <td>{_when(j['created_at'], now)}</td>
       </tr>""" for j in failed_jobs) or "<tr><td colspan='4'>Sin fallas registradas.</td></tr>"
 
     return HTMLResponse(f"""<!doctype html>
@@ -1410,6 +1754,7 @@ def admin_node_detail(node_id: str):
   th {{ color:#9aa0a6; font-weight:600; }}
   a {{ color:#7fb0ff; }}
   .summary {{ color:#9aa0a6; font-size:0.9rem; }}
+  .ts {{ color:#7a7f87; font-size:0.72rem; white-space:nowrap; }}
   .grid {{ display:grid; grid-template-columns: repeat(auto-fit, minmax(220px,1fr)); gap:1rem; margin-top:1rem; }}
   .card {{ background:#171a20; border:1px solid #2a2d34; border-radius:8px; padding:1rem; }}
   .card h3 {{ margin:0 0 0.6rem 0; font-size:0.78rem; color:#9aa0a6; text-transform:uppercase; letter-spacing:0.05em; }}
@@ -1424,7 +1769,7 @@ def admin_node_detail(node_id: str):
 <body>
   <p><a href="/admin">← Volver al panel</a></p>
   <h1>{html.escape(node["name"] or "")} {"🟢" if online else "⚪"}</h1>
-  <p class="summary">node_id: {node_id} · {"⏸️ Pausado" if paused else "✅ Activo"} · visto hace {_ago(node["last_seen"], now)} · {total_jobs} trabajos totales, {fail_count} fallidos</p>
+  <p class="summary">node_id: {node_id} · {"⏸️ Pausado" if paused else "✅ Activo"} · registrado el {_fmt_dt(node.get("registered_at"))} · visto hace {_ago(node["last_seen"], now)} ({_fmt_dt(node["last_seen"])}) · {total_jobs} trabajos totales, {fail_count} fallidos</p>
 
   <div class="grid">
     <div class="card">
@@ -1549,6 +1894,7 @@ def admin_client_detail(client_name: str):
   th {{ color:#9aa0a6; font-weight:600; }}
   a {{ color:#7fb0ff; }}
   .summary {{ color:#9aa0a6; font-size:0.9rem; }}
+  .ts {{ color:#7a7f87; font-size:0.72rem; white-space:nowrap; }}
   .grid {{ display:grid; grid-template-columns: repeat(auto-fit, minmax(220px,1fr)); gap:1rem; margin-top:1rem; }}
   .card {{ background:#171a20; border:1px solid #2a2d34; border-radius:8px; padding:1rem; }}
   .card h3 {{ margin:0 0 0.6rem 0; font-size:0.78rem; color:#9aa0a6; text-transform:uppercase; letter-spacing:0.05em; }}
@@ -1562,7 +1908,7 @@ def admin_client_detail(client_name: str):
 <body>
   <p><a href="/admin">← Volver al panel</a></p>
   <h1>{html.escape(client_name)}</h1>
-  <p class="summary">{total} trabajos totales (mostrando los ultimos 100) · ultimo pedido hace {_ago(latest["created_at"], now)}</p>
+  <p class="summary">{total} trabajos totales (mostrando los ultimos 100) · ultimo pedido hace {_ago(latest["created_at"], now)} ({_fmt_dt(latest["created_at"])})</p>
 
   <div class="grid">
     <div class="card">
@@ -1624,7 +1970,7 @@ def admin_session_detail(session_id: str):
           <td>{role_icon} {html.escape(m["role"])}</td>
           <td>{html.escape(m["content"])}{flags_html}</td>
           <td>{m["token_estimate"]}</td>
-          <td>{_ago(m["created_at"], now)}</td>
+          <td>{_when(m["created_at"], now)}</td>
         </tr>"""
 
     messages_html = "".join(_message_row(m) for m in messages) or \
@@ -1647,6 +1993,7 @@ def admin_session_detail(session_id: str):
   th {{ color:#9aa0a6; font-weight:600; }}
   a {{ color:#7fb0ff; }}
   .summary {{ color:#9aa0a6; font-size:0.9rem; }}
+  .ts {{ color:#7a7f87; font-size:0.72rem; white-space:nowrap; }}
   .card {{ background:#171a20; border:1px solid #2a2d34; border-radius:8px; padding:1rem; margin-top:1rem; }}
   button {{ background:#2a2d34; color:#e6e6e6; border:1px solid #3a3d44; border-radius:4px; padding:0.3rem 0.6rem; cursor:pointer; font-size:0.8rem; }}
   button.danger:hover {{ background:#5c2020; border-color:#7a2a2a; }}
@@ -1655,7 +2002,7 @@ def admin_session_detail(session_id: str):
 <body>
   <p><a href="/admin">← Volver al panel</a></p>
   <h1>Sesion {session_id}</h1>
-  <p class="summary">{len(messages)} mensajes · creada hace {_ago(session["created_at"], now)} · ultimo uso hace {_ago(session["last_used_at"], now)}</p>
+  <p class="summary">{len(messages)} mensajes · creada el {_fmt_dt(session["created_at"])} · ultimo uso hace {_ago(session["last_used_at"], now)} ({_fmt_dt(session["last_used_at"])})</p>
 
   <div class="card">
     <b>Resumen acumulado (memoria de largo plazo):</b>
@@ -1686,6 +2033,113 @@ def admin_delete_session(session_id: str):
     que DELETE /sessions/{{id}}, expuesta como boton en vez de API)."""
     with db() as conn:
         memory.delete_session(conn, session_id)
+    return RedirectResponse("/admin", status_code=303)
+
+
+@app.get("/admin/tasks/{task_id}", response_class=HTMLResponse)
+def admin_task_detail(task_id: str):
+    """
+    Pagina de detalle de una tarea compuesta: modo, estrategia de
+    agregacion, resultado final (si ya termino), metricas, y la lista
+    completa de subtareas con que nodo ejecuto cada una -- la
+    trazabilidad completa entre tarea padre, subtareas, nodos y
+    resultado final que pide el diseño de Task Decomposition.
+    """
+    now = time.time()
+    with db() as conn:
+        task = tasks.get_task(conn, task_id)
+        if not task:
+            raise HTTPException(404, "Task not found")
+        if tasks.check_timeout(conn, task):
+            task = tasks.get_task(conn, task_id)
+        task = dict(task)
+        metrics = tasks.compute_metrics(conn, task_id)
+        subtasks = [dict(r) for r in conn.execute("""
+          SELECT jobs.*, nodes.name AS node_name FROM jobs
+          LEFT JOIN nodes ON nodes.node_id = jobs.assigned_node
+          WHERE jobs.task_id=? ORDER BY jobs.created_at ASC
+        """, (task_id,)).fetchall()]
+
+    subtasks_html = "".join(_job_row(j, now) for j in subtasks) or \
+        "<tr><td colspan='10'>Sin subtareas.</td></tr>"
+
+    result_preview = "N/A"
+    if task["result"]:
+        try:
+            result_preview = json.dumps(json.loads(task["result"]), indent=2, ensure_ascii=False)
+        except json.JSONDecodeError:
+            result_preview = task["result"]
+
+    return HTMLResponse(f"""<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="refresh" content="5">
+<title>Sauzal · Tarea {task_id[:8]}</title>
+<style>
+  body {{ font-family: system-ui, sans-serif; background:#0f1115; color:#e6e6e6; margin:2rem; }}
+  h1 {{ font-size:1.4rem; margin-bottom:0.2rem; }}
+  h2 {{ font-size:1.1rem; margin-top:2rem; color:#9aa0a6; }}
+  table {{ width:100%; border-collapse: collapse; margin-top:0.5rem; }}
+  th, td {{ text-align:left; padding:0.5rem 0.7rem; border-bottom:1px solid #2a2d34; font-size:0.9rem; vertical-align:top; }}
+  th {{ color:#9aa0a6; font-weight:600; }}
+  a {{ color:#7fb0ff; }}
+  .summary {{ color:#9aa0a6; font-size:0.9rem; }}
+  .ts {{ color:#7a7f87; font-size:0.72rem; white-space:nowrap; }}
+  .grid {{ display:grid; grid-template-columns: repeat(auto-fit, minmax(220px,1fr)); gap:1rem; margin-top:1rem; }}
+  .card {{ background:#171a20; border:1px solid #2a2d34; border-radius:8px; padding:1rem; }}
+  .card h3 {{ margin:0 0 0.6rem 0; font-size:0.78rem; color:#9aa0a6; text-transform:uppercase; letter-spacing:0.05em; }}
+  .card div {{ font-size:0.95rem; margin-bottom:0.25rem; }}
+  pre {{ background:#171a20; border:1px solid #2a2d34; border-radius:8px; padding:1rem; overflow-x:auto; font-size:0.85rem; white-space:pre-wrap; word-break:break-word; }}
+  button {{ background:#2a2d34; color:#e6e6e6; border:1px solid #3a3d44; border-radius:4px; padding:0.3rem 0.6rem; cursor:pointer; font-size:0.8rem; }}
+  button.danger:hover {{ background:#5c2020; border-color:#7a2a2a; }}
+</style>
+</head>
+<body>
+  <p><a href="/admin">← Volver al panel</a></p>
+  <h1>Tarea {task_id} {_TASK_STATUS_ICON.get(task["status"], "")}</h1>
+  <p class="summary">Modo: {html.escape(task["mode"])} · Agregacion: {html.escape(task["aggregation"])} · Estado: {html.escape(task["status"])} · Creada el {_fmt_dt(task["created_at"])}{f' · Completada el {_fmt_dt(task["completed_at"])}' if task["completed_at"] else ''}</p>
+
+  <div class="grid">
+    <div class="card">
+      <h3>Metricas</h3>
+      <div>Subtareas: {metrics["subtask_count"]} ({metrics["succeeded"]} exitosas, {metrics["failed"]} fallidas, {metrics["cancelled"]} canceladas)</div>
+      <div>Nodos usados: {metrics["nodes_used"]}</div>
+      <div>Reintentos: {metrics["retries"]}</div>
+      <div>Duracion promedio por subtarea: {_fmt(metrics["avg_subtask_duration_ms"], " ms")}</div>
+      <div>Duracion maxima: {_fmt(metrics["max_subtask_duration_ms"], " ms")}</div>
+      <div>Duracion de agregacion: {_fmt(metrics["aggregation_duration_ms"], " ms")}</div>
+      <div>Tokens: {_fmt(metrics["prompt_tokens"])} in / {_fmt(metrics["output_tokens"])} out</div>
+    </div>
+    <div class="card">
+      <h3>Politica de limites</h3>
+      <div>{html.escape(task["policy"] or "{}")}</div>
+    </div>
+  </div>
+
+  <h2>Resultado final</h2>
+  <pre>{html.escape(result_preview)}</pre>
+  {f'<p class="summary">Error: {html.escape(task["error"])}</p>' if task["error"] else ""}
+
+  <form method="post" action="/admin/tasks/{task_id}/cancel" onsubmit="return confirm('¿Cancelar esta tarea?')">
+    <button class="danger">Cancelar tarea</button>
+  </form>
+
+  <h2>Subtareas (trazabilidad completa)</h2>
+  <table>
+    <tr><th>Job</th><th>Modelo</th><th>Prompt</th><th>Cliente</th><th>Estado</th><th>Nodo</th><th>Tokens (in/out)</th><th>Duracion</th><th>Creado hace</th><th>Acciones</th></tr>
+    {subtasks_html}
+  </table>
+</body>
+</html>""")
+
+
+@app.post("/admin/tasks/{task_id}/cancel")
+def admin_cancel_task(task_id: str):
+    """Cancela una tarea desde el panel (misma logica que POST
+    /tasks/{{id}}/cancel, expuesta como boton en vez de API)."""
+    with db() as conn:
+        tasks.cancel_task(conn, task_id)
     return RedirectResponse("/admin", status_code=303)
 
 

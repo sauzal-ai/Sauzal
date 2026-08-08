@@ -235,8 +235,21 @@ con `CREATE TABLE IF NOT EXISTS`). Son solo dos tablas.
 | `latency_ms` | REAL | Servidor, con el dato que manda el agente | En cada `POST /nodes/heartbeat`. Es el tiempo de ida y vuelta del heartbeat ANTERIOR (medido por el propio agente) — sirve como proxy de qué tan lejos/lenta está la conexión de ese nodo con el servidor. |
 | `ip_address` | TEXT | Servidor, calculada de la conexión HTTP | Al registrar y en cada heartbeat. Ver `client_ip()`: usa el header `CF-Connecting-IP` (Cloudflare) o `X-Forwarded-For` si existen, si no la IP directa de la conexión TCP. **El agente no manda ni puede falsificar este campo.** |
 | `location` | TEXT | Servidor, resuelta a partir de `ip_address` | Al registrar y en cada heartbeat (cacheada por IP, ver `geolocate()`), consultando el servicio externo gratuito `ip-api.com`. `NULL` si la IP es privada/LAN (127.0.0.1, 192.168.x.x, etc.) o si la consulta externa falla. |
+| `registered_at` | REAL (timestamp epoch) | Servidor | Al registrar, una sola vez — a diferencia de `last_seen`, NUNCA se actualiza después. Sirve para saber "hace cuánto es parte de la red", distinto de "hace cuánto se vio por última vez". |
 
 **Sobre el envío de IPs a un servicio externo:** `geolocate()` manda la IP pública (nunca las privadas) a `ip-api.com` para resolver ciudad/país. Es una decisión consciente de diseño, confirmada explícitamente al implementar esta función — si en algún momento se quiere sacar esa dependencia externa, alcanza con hacer que `geolocate()` devuelva siempre `None`.
+
+**Sobre cómo se muestran las fechas en `/admin`:** todos los timestamps
+de la base son epoch (float, UTC implícito). El panel los muestra con
+`_when()` (`server/main.py`): el tiempo relativo ("hace 5s", fácil de
+escanear) arriba, y abajo, en texto más chico, la fecha/hora completa
+con milisegundos y zona horaria explícita vía `_fmt_dt()` — ej.
+`2026-08-08 02:22:33.352 -0400`. La zona horaria usada es la **local del
+servidor** (`datetime.astimezone()` sin argumentos toma la del sistema
+operativo donde corre `uvicorn`); si quien mira el panel está en otro
+huso horario, el offset explícito es lo que permite no confundirse. Un
+aviso arriba de todo en `/admin` ("Hora del servidor: ...") deja esto
+claro de entrada.
 
 **Los campos dentro de `capabilities` (JSON armado por `agent.py::capabilities()`):**
 
@@ -520,3 +533,211 @@ realmente vino de la memoria semántica (y no de casualidad), revisar
 una sección "Contexto relevante de mensajes anteriores" con la frase del
 BMW Isetta, y `context_semantic_hits` va a ser mayor a 0. También se
 puede ver todo desde `/admin/sessions/{session_id}` en el navegador.
+
+## 7. Task Decomposition + Aggregation (tareas compuestas)
+
+Toda la lógica vive en **`server/tasks.py`** — un módulo nuevo, sin
+dependencias externas, que le permite a Sauzal recibir una tarea
+compleja, partirla en subtareas (independientes o con dependencias entre
+sí), repartirlas entre los nodos disponibles **en cada momento** (sin
+importar si hay 1 o 50), y combinar los resultados en uno final. El
+agente (`agent/agent.py`) **no cambió ni una línea**: cada subtarea le
+llega como un prompt de texto más, indistinguible de cualquier `/infer`
+suelto.
+
+### La idea central: el pool compartido de subtareas
+
+Un `/infer` normal elige UN nodo disponible en el momento y le asigna el
+job directamente (`assigned_node` ya viene seteado desde que se crea la
+fila). Las subtareas de una tarea, en cambio, se crean con
+`assigned_node=NULL` y quedan en un **pool compartido**: cualquier nodo
+que haga `POST /agent/pull` y no tenga ya algo asignado directamente
+intenta reclamar una del pool (`tasks.claim_subtask()`), de forma
+atómica (`UPDATE ... WHERE assigned_node IS NULL`, chequeando que
+realmente se haya actualizado una fila, para no pisar a otro nodo que la
+haya tomado en el mismo instante).
+
+```
+POST /agent/pull:
+  1. ¿Tengo un job asignado DIRECTAMENTE a mí? (el /infer de siempre)
+     -> si hay, listo, es ese.
+  2. Si no, ¿hay alguna subtarea en el pool (task_id seteado,
+     assigned_node=NULL, status='queued') que yo pueda tomar?
+     -> filtro por sus `requires` (si pide una capacidad puntual) y por
+        la política de la tarea (max_parallel / max_nodes)
+     -> la reclamo atómicamente (assigned_node=yo, status='running')
+  3. Si tampoco, {"job": None} -- espero al próximo ciclo.
+```
+
+Esto es lo que permite "ejecutarlas en distintos nodos remotos cuando
+sea posible": si hay 4 nodos libres para 4 subtareas, cada uno se lleva
+una y corren en paralelo real; si solo hay 1 nodo, las procesa una por
+una sin que nadie tenga que reintentar ni reprogramar nada.
+
+### Modelo conceptual: tarea padre, subtareas, dependencias
+
+- **`tasks`**: la tarea padre (modo, estrategia de agregación, política
+  de límites, resultado final, status global).
+- **subtareas**: filas de **la misma tabla `jobs`** de siempre, con
+  `task_id` apuntando a su tarea. Traen todo lo que ya tenía un job
+  (modelo, prompt, resultado, tokens, duración, qué nodo la ejecutó) más
+  cuatro campos nuevos: `depends_on`, `requires`, `subtask_key`,
+  `retry_count`.
+- **Dependencias**: `depends_on` es una lista de `job_id` de otras
+  subtareas de la MISMA tarea. Una subtarea con dependencias sin cumplir
+  arranca en un status nuevo, `'blocked'` — no es candidata para
+  `claim_subtask()` hasta que todas terminen. Al completarse una
+  dependencia, `_unblock_dependents()` revisa quién estaba esperándola;
+  si ya tiene TODAS sus dependencias resueltas, resuelve los
+  placeholders `{{key.result}}` de su prompt (`resolve_template()`) con
+  el resultado real de cada dependencia, y la pasa a `'queued'`.
+
+```
+A y B sin dependencias -> arrancan 'queued' de una, cualquier nodo las toma
+C depende de A y B -> arranca 'blocked'
+D depende de C -> arranca 'blocked'
+
+Cuando A Y B terminan -> C pasa a 'queued' (con su prompt ya resuelto)
+Cuando C termina -> D pasa a 'queued'
+```
+
+### Modos y estrategias de agregación
+
+| `mode` | `aggregation` por defecto | Comportamiento |
+|---|---|---|
+| `batch` | `collect_all` | Espera TODAS las subtareas; si una falla sin reintentos, la tarea entera falla. Resultado: `{"results": {key: respuesta}}`. |
+| `fan_out` | `first_success` | La primera subtarea exitosa gana: finaliza la tarea de inmediato y cancela (blando) el resto. |
+| `first_success` | `first_success` | Igual que `fan_out`, nombre explícito para cuando el caso de uso es justamente ese. |
+| `pipeline` | `collect_all` | Subtareas encadenadas por `depends_on`, cada una puede referenciar el resultado de otra con `{{key.result}}`. |
+| `map_reduce` | `llm_synthesize` | Como `batch`, pero el "reduce" es OTRO job (`kind` implícito vía `subtask_key='__aggregate__'`) que le pide a un nodo que sintetice las N respuestas en una sola. |
+| `consensus` | `vote` | Espera mayoría estricta (o que terminen todas) y elige la respuesta más repetida. |
+
+`aggregation` se puede pisar explícitamente en `POST /tasks` sin importar
+el `mode` (por ejemplo, un `batch` con `aggregation: "concat"` en vez de
+`collect_all`).
+
+### Cancelación: siempre blanda, nunca preventiva
+
+Cuando una tarea se finaliza (por éxito, por fallo, o a pedido explícito
+vía `POST /tasks/{id}/cancel`), `_cancel_remaining()` marca `'cancelled'`
+todas las subtareas que seguían `queued`/`blocked`/`running`. **Esto no
+interrumpe a ningún nodo a mitad de una inferencia** — no hay forma de
+hacerlo con el diseño actual del agente (una llamada bloqueante a
+Ollama/ComfyUI). Si un nodo ya estaba ejecutando una subtarea cancelada,
+su resultado va a llegar igual más tarde por `POST /jobs/{id}/result`;
+`on_subtask_completed()` corta apenas ve que la tarea ya está en un
+estado terminal, así que ese resultado tardío simplemente se ignora.
+Probado en `test_fan_out_first_success_uses_first_and_cancels_rest`.
+
+Una cancelación *preventiva* real (avisarle al nodo "parate ya") queda
+fuera de esta versión — requeriría que `agent.py` chequee periódicamente
+"¿siguen necesitando esto?" entre operaciones largas, o que aborte la
+conexión HTTP a Ollama a mitad de generación.
+
+### Reintentos
+
+Si una subtarea falla y `policy.max_retries` todavía no se agotó
+(`job.retry_count < max_retries`), `_requeue_retry()` crea una subtarea
+NUEVA (mismo prompt/requires/dependencias, `retry_count+1`) de vuelta en
+el pool compartido, para que la tome cualquier nodo disponible.
+
+**Limitación aceptada:** no se excluye a propósito al nodo que falló —
+en una red chica de pocos nodos, evitarlo podría dejar la subtarea sin
+ningún candidato posible. Si hace falta esa garantía más adelante, se
+puede guardar una lista de nodos excluidos en el job.
+
+### Filtrado por capacidades (`requires`)
+
+Una subtarea puede pedir `requires: {"service": "comfyui"}` o
+`requires: {"model": "flux1-schnell-fp8"}`; `claim_subtask()` solo deja
+que la reclame un nodo cuyo `capabilities` (el mismo JSON de siempre, ver
+sección 5) cumpla eso. Así una tarea puede mezclar subtareas de texto e
+imagen, cada una yendo a nodos con hardware distinto, sin que el
+servidor tenga que saber de antemano cuáles.
+
+### Políticas de límite (`policy`)
+
+| Campo | Se enforce | Cómo |
+|---|---|---|
+| `max_parallel` | Sí | En `claim_subtask()`: no se entrega una subtarea más de esa tarea si ya hay `max_parallel` corriendo (`status='running'`). |
+| `max_nodes` | Sí | En `claim_subtask()`: no se permite que un nodo NUEVO se sume a la tarea si ya se usaron `max_nodes` nodos distintos (un nodo que ya participó sí puede seguir tomando más). |
+| `max_retries` | Sí | Ver "Reintentos" arriba. |
+| `max_time_s` | Sí, de forma perezosa | No hay ningún proceso de fondo corriendo: `check_timeout()` se evalúa cada vez que algo consulta la tarea (`GET /tasks/{id}` y cada `on_subtask_completed()`). Si se pasó, finaliza como fallida por timeout. |
+| `max_cost` | **No, solo informativo** | Igual limitación que el costo eléctrico de un nodo (sección 5): no hay medición de energía POR JOB, solo acumulada por nodo. Reservado en el esquema para cuando exista esa medición más fina. |
+
+### Métricas por tarea (`GET /tasks/{id}` → `metrics`)
+
+`tasks.compute_metrics()` las calcula al vuelo a partir de las filas de
+`jobs` de esa tarea — no se duplica nada en una tabla aparte:
+`subtask_count`, `nodes_used`, `succeeded`, `failed`, `cancelled`,
+`retries`, `avg_subtask_duration_ms`, `max_subtask_duration_ms`,
+`aggregation_duration_ms` (si hubo un job de síntesis), `prompt_tokens`,
+`output_tokens`.
+
+### Memoria de sesión: solo el resultado agregado, nunca cada subtarea
+
+Si `POST /tasks` viene con `session_id`, la tarea queda asociada a esa
+sesión, pero **las subtareas individuales no le escriben nada a la
+memoria de la sesión**. Recién cuando la tarea entera termina
+(`on_subtask_completed()` devuelve la fila de `tasks` ya finalizada, no
+`None`), el resultado agregado se guarda como UN mensaje del asistente
+(`_task_result_text()` sabe extraer un texto legible tanto de
+`{"response":...}` como de `{"results": {...}}`). Esto es justamente lo
+que pide el diseño: "no enviar información innecesaria" y "actualizar la
+memoria de sesión solamente cuando corresponda". Probado en
+`test_task_result_updates_session_memory_only_once_on_completion`.
+
+### Lo que NO hace (a propósito)
+
+- No parte una única inferencia entre varias GPUs (nada de tensor
+  parallelism) — cada subtarea es una inferencia completa e independiente
+  en UN nodo.
+- No decide sola cómo descomponer una tarea: el cliente arma la lista de
+  subtareas (con sus `key`, `depends_on`, `requires`) en `POST /tasks`.
+  Un "planificador" automático (un job que decida la descomposición)
+  queda como extensión futura posible, no está en esta versión.
+- No garantiza aislamiento físico/de red entre nodos: dos subtareas de
+  la misma tarea pueden terminar en el mismo nodo o en nodos en
+  cualquier parte del mundo, sin ninguna suposición de cercanía.
+
+### API
+
+- `POST /tasks` — crea la tarea y todas sus subtareas de una. Body:
+  `{mode, subtasks: [{key, model, prompt, depends_on?, requires?}],
+  session_id?, aggregation?, policy?}`. Devuelve `{task_id, subtasks:
+  {key: job_id}}`.
+- `GET /tasks/{id}` — status, resultado final (si terminó), métricas.
+- `GET /tasks/{id}/subtasks` — cada subtarea con su status y qué nodo la
+  ejecutó (trazabilidad completa).
+- `POST /tasks/{id}/cancel` — cancelación a pedido (blanda, ver arriba).
+- `/admin` tiene una sección "Tareas compuestas" y una página de detalle
+  por tarea (`/admin/tasks/{id}`) con las mismas métricas y trazabilidad.
+
+### Cómo probarlo
+
+**A) Automático** (sin GPU, nodos simulados — `tests/test_tasks.py`):
+```powershell
+pytest tests/test_tasks.py -v
+```
+Cubre los dos casos mínimos pedidos (batch de 4 en paralelo, fan-out con
+cancelación) más pipeline, reintentos, límite de capacidades,
+`max_parallel`, cancelación explícita, y la integración con memoria de
+sesión.
+
+**B) En vivo, con nodos reales** (`client/task.py`, mismo estilo que
+`client/infer.py`):
+```powershell
+# Caso 1: batch -- una subtarea por cada --prompt
+python client\task.py --server http://IP_DEL_SERVIDOR:8000 --mode batch --model gemma3:4b \
+    --prompt "Parte 1" --prompt "Parte 2" --prompt "Parte 3" --prompt "Parte 4"
+
+# Caso 2: fan-out -- la misma pregunta a 3 nodos, se usa la primera respuesta
+python client\task.py --server http://IP_DEL_SERVIDOR:8000 --mode fan_out --model gemma3:4b \
+    --prompt "Decime un chiste corto" --replicas 3
+```
+El script hace polling de `GET /tasks/{id}` y al terminar imprime la
+trazabilidad completa (qué nodo ejecutó cada subtarea), las métricas, y
+el resultado agregado final. Con un solo nodo real disponible ya se ve
+el mecanismo funcionando (las subtareas se procesan en cola en vez de en
+paralelo real, pero toda la lógica de reparto/agregación/cancelación es
+la misma); con más nodos online, se reparten de verdad en paralelo.
