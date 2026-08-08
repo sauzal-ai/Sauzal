@@ -8,6 +8,7 @@ el diseño ("el contexto lo administra Sauzal, no el nodo").
 """
 import json
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -21,7 +22,7 @@ def _register_node(client, name):
         "capabilities": json.dumps({"services": {"ollama": True}}),
     })
     assert r.status_code == 200
-    return r.json()  # {"node_id": ..., "token": ...}
+    return {"name": name, **r.json()}  # {"name": ..., "node_id": ..., "token": ...}
 
 
 def _heartbeat(client, node):
@@ -227,3 +228,89 @@ def test_delete_session_via_admin_panel_removes_it(client):
 
     client.post("/admin/sessions/{}/delete".format(session_id))
     assert client.get(f"/sessions/{session_id}").status_code == 404
+
+
+def test_multiple_sessions_run_concurrently_without_cross_contamination(client):
+    """
+    Un mismo cliente tiene que poder mantener N sesiones activas al
+    mismo tiempo: dispara varias conversaciones con THREADS REALES (no
+    una despues de la otra) y verifica que ninguna vea el contexto de
+    las demas, y que ninguna request falle por contencion de la base
+    (esto es lo que habilita el WAL mode de startup()).
+
+    Cada conversacion usa su propio nodo dedicado para que la
+    disponibilidad de nodos no sea un cuello de botella artificial que
+    confunda la prueba de concurrencia real entre sesiones.
+    """
+    facts = [
+        ("verde", "Mi color favorito es el verde"),
+        ("Isetta", "Mi auto favorito es un BMW Isetta"),
+        ("ajedrez", "Mi hobby favorito es el ajedrez"),
+        ("pizza", "Mi comida favorita es la pizza"),
+    ]
+    nodes = [_register_node(client, f"node-parallel-{i}") for i in range(len(facts))]
+    for node in nodes:
+        _heartbeat(client, node)
+    session_ids = [client.post("/sessions", json={}).json()["session_id"] for _ in facts]
+
+    def run_conversation(node, session_id, fact_text):
+        r = client.post("/infer", json={
+            "model": "gemma3:4b", "session_id": session_id,
+            "prompt": fact_text, "node": node["name"],
+        })
+        assert r.status_code == 200, r.text
+        job = r.json()
+        assert job["assigned_node"] == node["node_id"]
+        _complete_job(client, node, job["job_id"], f"Anotado: {fact_text}")
+
+    with ThreadPoolExecutor(max_workers=len(facts)) as pool:
+        futures = [
+            pool.submit(run_conversation, node, session_id, fact_text)
+            for node, session_id, (_, fact_text) in zip(nodes, session_ids, facts)
+        ]
+        for f in futures:
+            f.result()  # relanza cualquier excepcion/assert que haya pasado en el thread
+
+    # Cada sesion tiene que ver SOLO su propio dato, nada de las demas.
+    for session_id, (keyword, _fact_text) in zip(session_ids, facts):
+        messages = client.get(f"/sessions/{session_id}/messages").json()["messages"]
+        contents = " ".join(m["content"] for m in messages)
+        assert keyword in contents
+        for other_keyword, _ in facts:
+            if other_keyword != keyword:
+                assert other_keyword not in contents
+
+
+def test_same_session_concurrent_requests_do_not_corrupt_history(client):
+    """
+    Si el cliente dispara dos pedidos de LA MISMA sesion en paralelo
+    (por ejemplo, sin esperar la respuesta del primero), el lock por
+    sesion (`_lock_for_session`) tiene que evitar que se pisen: los dos
+    mensajes de usuario tienen que terminar guardados, sin perder
+    ninguno y sin que el servidor tire una excepcion.
+    """
+    node_a = _register_node(client, "node-concurrent-a")
+    node_b = _register_node(client, "node-concurrent-b")
+    _heartbeat(client, node_a)
+    _heartbeat(client, node_b)
+    session_id = client.post("/sessions", json={}).json()["session_id"]
+
+    def send(node, i):
+        r = client.post("/infer", json={
+            "model": "gemma3:4b", "session_id": session_id,
+            "prompt": f"Mensaje concurrente numero {i}", "node": node["name"],
+        })
+        assert r.status_code == 200, r.text
+        return r.json()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        jobs = list(pool.map(lambda args: send(*args), [(node_a, 1), (node_b, 2)]))
+
+    for job, node in zip(jobs, (node_a, node_b)):
+        _complete_job(client, node, job["job_id"], f"Respuesta a {job['job_id'][:6]}")
+
+    messages = client.get(f"/sessions/{session_id}/messages").json()["messages"]
+    user_msgs = [m["content"] for m in messages if m["role"] == "user"]
+    assert "Mensaje concurrente numero 1" in user_msgs
+    assert "Mensaje concurrente numero 2" in user_msgs
+    assert len(user_msgs) == 2, "ningun mensaje deberia perderse ni pisarse"

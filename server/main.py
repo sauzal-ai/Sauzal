@@ -68,8 +68,8 @@ Limitaciones conocidas (ver README, seccion "No usar en produccion")
 """
 
 from __future__ import annotations
-import html, ipaddress, json, os, sqlite3, time, urllib.parse, uuid
-from contextlib import contextmanager
+import html, ipaddress, json, os, sqlite3, threading, time, urllib.parse, uuid
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 import requests
 from fastapi import FastAPI, Form, HTTPException, Request
@@ -178,6 +178,38 @@ def geolocate(ip: str) -> str | None:
         location = None
     _GEO_CACHE[ip] = location
     return location
+
+
+# ----------------------------------------------------------------------
+# Concurrencia por sesion. FastAPI corre cada request de forma sincrona
+# en un thread pool (los endpoints de este archivo son `def`, no `async
+# def`), asi que dos inferencias de sesiones DISTINTAS pueden estar
+# ejecutandose al mismo tiempo sin problema (cada una con su propia
+# conexion SQLite, ver db()) -- eso es justamente lo que se busca:
+# "un mismo cliente debe poder ejecutar simultaneamente multiples
+# inferencias pertenecientes a distintas sesiones".
+#
+# Pero si dos requests le pegan a LA MISMA sesion al mismo tiempo (por
+# ejemplo, el cliente dispara dos preguntas juntas sin esperar la
+# primera), sin ningun tipo de exclusion mutua podrian pisarse: las dos
+# leerian el historial "antes" de que la otra guarde su mensaje, y
+# terminarian generando contexto incompleto o mensajes en un orden
+# incoherente. Un Lock por session_id serializa esas dos requests puntuales
+# (se ejecutan una despues de la otra) sin afectar en nada a sesiones
+# distintas, que no comparten lock y siguen corriendo en paralelo.
+_session_locks_guard = threading.Lock()
+_session_locks: dict[str, threading.Lock] = {}
+
+def _lock_for_session(session_id: str) -> threading.Lock:
+    """Devuelve (creandolo si hace falta) el Lock exclusivo de una
+    sesion puntual. `_session_locks_guard` solo protege la creacion de
+    la entrada en el dict -- una vez obtenido, el Lock en si se usa
+    normalmente con `with _lock_for_session(id):`."""
+    with _session_locks_guard:
+        lock = _session_locks.get(session_id)
+        if lock is None:
+            lock = _session_locks[session_id] = threading.Lock()
+        return lock
 
 
 def _pick_available_node(conn, node_hint: str | None = None):
@@ -352,6 +384,15 @@ def startup():
     hace falta borrar la base a mano.
     """
     with db() as conn:
+        # WAL (Write-Ahead Logging): permite que lecturas y escrituras
+        # concurrentes convivan sin bloquearse mutuamente -- importante
+        # porque FastAPI corre cada request en su propio thread (con su
+        # propia conexion SQLite, ver db()), y con dos o mas sesiones
+        # atendiendo inferencias al mismo tiempo, el modo por defecto de
+        # SQLite (rollback journal) puede devolver "database is locked"
+        # bajo carga. Es una configuracion persistente en el archivo de
+        # la base, no hace falta repetirla en cada conexion nueva.
+        conn.execute("PRAGMA journal_mode=WAL")
         conn.executescript("""
         CREATE TABLE IF NOT EXISTS nodes(
           node_id TEXT PRIMARY KEY, name TEXT, token TEXT, status TEXT,
@@ -641,9 +682,17 @@ def infer(req: Infer, request: Request):
 
     El nodo que ejecuta esto NUNCA se entera de que existe una sesion:
     solo ve un prompt de texto, como cualquier otro job.
+
+    Concurrencia: si viene `session_id`, todo el bloque queda serializado
+    por `_lock_for_session()` -- evita que dos pedidos simultaneos a la
+    MISMA sesion lean el historial "a medio guardar" del otro y armen
+    contexto incoherente. Los pedidos stateless (sin session_id) y los
+    de sesiones DISTINTAS no comparten lock: siguen ejecutandose en
+    paralelo sin esperarse entre si.
     """
     now=time.time()
-    with db() as conn:
+    lock = _lock_for_session(req.session_id) if req.session_id else nullcontext()
+    with lock, db() as conn:
         node = _pick_available_node(conn, req.node)
         if not node:
             raise HTTPException(503,"No available Sauzal nodes")
@@ -773,6 +822,13 @@ def result(job_id: str, req: Result):
 
     No valida que el job_id realmente estuviera asignado a este node_id
     (posible mejora: chequear `assigned_node=?` en el UPDATE).
+
+    Concurrencia: la parte de memoria (guardar el mensaje del asistente,
+    evaluar el resumen automatico) va en un segundo bloque, DESPUES de
+    saber el `session_id` del job, tomando el mismo lock por sesion que
+    usa /infer -- asi dos resultados que llegan casi juntos para la
+    MISMA sesion (por ejemplo, si el cliente disparo dos pedidos de esa
+    sesion en paralelo) no se pisan al guardar los mensajes.
     """
     with db() as conn:
         authenticate(conn, req.node_id, req.token)
@@ -788,7 +844,8 @@ def result(job_id: str, req: Result):
             (time.time(),req.node_id)
         )
 
-        if req.success and job and job["session_id"]:
+    if req.success and job and job["session_id"]:
+        with _lock_for_session(job["session_id"]), db() as conn:
             try:
                 response_text = json.loads(req.result).get("response") if req.result else None
             except json.JSONDecodeError:

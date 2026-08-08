@@ -435,6 +435,37 @@ mezclar una transcripción de texto con un prompt de imagen), aunque el
 mensaje se sigue guardando para que el historial de la sesión quede
 completo.
 
+### Multi-sesión y concurrencia real
+
+Un mismo cliente puede tener **N sesiones activas en paralelo**, cada
+una con su propio historial, resumen y memoria semántica — no hay
+ningún límite artificial ni relación entre "cliente" (el campo `client`,
+solo informativo) y "sesión": el aislamiento es pura y exclusivamente
+por `session_id`. Dos sesiones nunca comparten candidatos de búsqueda
+semántica entre sí (`memory.build_context()` solo consulta los mensajes
+de ESA sesión), así que no hay forma de que se "contaminen".
+
+Como FastAPI corre cada request de forma síncrona en un thread pool,
+esto además funciona con **concurrencia real** (no solo intercalado):
+dos inferencias de sesiones distintas literalmente se ejecutan al mismo
+tiempo, en threads distintos. Dos cosas hacen que esto sea seguro:
+
+1. **SQLite en modo WAL** (`PRAGMA journal_mode=WAL`, activado una vez
+   en `startup()`): sin esto, bajo carga concurrente el modo por
+   defecto de SQLite puede devolver errores de `"database is locked"`.
+2. **Un lock en memoria por `session_id`** (`_lock_for_session()` en
+   `server/main.py`): si dos requests le pegan a la MISMA sesión al
+   mismo tiempo (por ejemplo, el cliente dispara dos mensajes de la
+   misma conversación sin esperar el primero), se serializan entre sí
+   para no pisarse leyendo/escribiendo el historial a medias. Sesiones
+   *distintas* usan locks *distintos* y jamás se esperan entre sí.
+
+Esto está probado con threads reales (no simulado) en
+`test_multiple_sessions_run_concurrently_without_cross_contamination`
+(N sesiones y N nodos en paralelo, sin mezclarse) y en
+`test_same_session_concurrent_requests_do_not_corrupt_history` (dos
+pedidos simultáneos de la misma sesión, ninguno se pierde).
+
 ### Cómo probarlo
 
 **A) Automático** (no necesita GPU ni Ollama — simula nodos falsos):
