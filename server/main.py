@@ -76,8 +76,14 @@ from fastapi import FastAPI, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from pydantic import BaseModel, Field
 
-# Base de datos SQLite, vive al lado de este archivo (server/sauzal.db).
-DB_PATH = Path(__file__).with_name("sauzal.db")
+from . import memory
+
+# Base de datos SQLite, vive al lado de este archivo (server/sauzal.db) por
+# defecto. Configurable via SAUZAL_DB_PATH para que los tests (ver tests/)
+# puedan apuntar a un archivo temporal sin tocar la base real -- en uso
+# normal (sin la variable de entorno seteada) el comportamiento es identico
+# al de siempre.
+DB_PATH = Path(os.environ.get("SAUZAL_DB_PATH") or Path(__file__).with_name("sauzal.db"))
 app = FastAPI(title="Sauzal Control Plane", version="0.2.0")
 
 
@@ -174,6 +180,47 @@ def geolocate(ip: str) -> str | None:
     return location
 
 
+def _pick_available_node(conn, node_hint: str | None = None):
+    """
+    Elige un nodo disponible (online, no pausado, no ocupado) para
+    asignarle un job. Si `node_hint` viene (nombre o node_id), se
+    restringe la busqueda a ESE nodo puntual. Devuelve la fila del nodo o
+    None si no hay ninguno que cumpla.
+
+    Extraido a una funcion propia porque lo necesitan dos casos: el
+    /infer normal de un cliente, y el resumen automatico de sesiones
+    (`_maybe_enqueue_summary()`), que tambien tiene que encolarle un job
+    a *algun* nodo disponible.
+    """
+    now = time.time()
+    if node_hint:
+        return conn.execute("""
+          SELECT node_id FROM nodes
+          WHERE status='available' AND last_seen>? AND COALESCE(paused,0)=0
+            AND (node_id=? OR name=?)
+          ORDER BY last_seen DESC LIMIT 1
+        """, (now-30, node_hint, node_hint)).fetchone()
+    return conn.execute("""
+      SELECT node_id FROM nodes
+      WHERE status='available' AND last_seen>? AND COALESCE(paused,0)=0
+      ORDER BY last_seen DESC LIMIT 1
+    """, (now-30,)).fetchone()
+
+
+def _is_image_model(model: str) -> bool:
+    """
+    Misma heuristica que `agent/comfy.py::is_image_model()` (por prefijo
+    de nombre), duplicada aca a proposito: el servidor la necesita para
+    decidir si tiene sentido inyectarle memoria de conversacion (texto) a
+    un pedido, SIN tener que importar el paquete del agente (que ademas
+    asume que ComfyUI esta corriendo localmente, cosa que no aplica en el
+    servidor). Si algun dia se agrega un tercer prefijo de modelo de
+    imagen, hay que actualizar los dos lugares.
+    """
+    m = (model or "").lower()
+    return m.startswith("flux") or m.startswith("sdxl") or m.startswith("sauzal-image")
+
+
 @app.on_event("startup")
 def startup():
     """
@@ -248,7 +295,56 @@ def startup():
                               punta a punta) y lo manda tanto si el job salio
                               bien como si fallo -- asi que tambien sirve para
                               ver cuanto tardo en fallar/timeoutear un job
+        session_id         -- si el pedido pertenece a una conversacion con
+                              memoria (ver mas abajo), a que sesion. NULL en
+                              pedidos sueltos (stateless), que siguen
+                              funcionando exactamente igual que siempre
+        kind               -- 'chat' (un pedido normal) | 'summarize' (un job
+                              INTERNO que el propio servidor encola para
+                              comprimir mensajes viejos de una sesion, ver
+                              memory.py). El agente no distingue nada especial:
+                              para el, un job 'summarize' es un prompt de texto
+                              mas, igual que cualquier otro
+        context_tokens_estimate/context_messages_used/context_semantic_hits
+                           -- metricas de cuanto contexto de la sesion se le
+                              inyecto al prompt de este job en particular
+                              (ver memory.py::build_context()). NULL en
+                              pedidos sin sesion o de tipo 'summarize'
+        summarize_message_ids -- (solo jobs kind='summarize') JSON con los
+                              message_id que este resumen puntual va a cubrir;
+                              al volver el resultado, esos mensajes se marcan
+                              summarized=1 y el texto va a sessions.summary
         created_at / updated_at -- timestamps (epoch)
+
+    Tabla `sessions` y `messages`: implementan la memoria de conversacion
+    (ver server/memory.py para el detalle completo de la logica). Un
+    "session_id" agrupa una conversacion que puede abarcar VARIOS jobs,
+    cada uno potencialmente ejecutado por un nodo/GPU distinto -- el
+    contexto para que la conversacion tenga continuidad lo arma y guarda
+    el SERVIDOR, nunca el agente.
+
+        sessions.session_id     -- UUID (PK), lo devuelve POST /sessions
+        sessions.tenant_id      -- reservado para multi-tenant futuro (hoy
+                                    siempre NULL, no se usa para filtrar nada)
+        sessions.created_at / last_used_at -- timestamps (epoch)
+        sessions.summary        -- resumen acumulado de los mensajes viejos
+                                    de la sesion (memoria de largo plazo),
+                                    generado automaticamente por un job
+                                    kind='summarize' cuando hace falta
+                                    (ver memory.py::SUMMARIZE_TRIGGER)
+
+        messages.message_id     -- UUID (PK)
+        messages.session_id     -- FK logica a sessions.session_id
+        messages.role           -- 'user' | 'assistant'
+        messages.content        -- texto del mensaje, tal cual
+        messages.created_at     -- timestamp (epoch)
+        messages.trivial        -- 0/1, si el mensaje es demasiado corto/generico
+                                    para servir como memoria semantica (ver
+                                    memory.py::is_trivial()) -- igual se guarda,
+                                    solo se excluye de la busqueda semantica
+        messages.token_estimate -- estimacion de tokens de ese mensaje
+        messages.summarized     -- 0/1, si ya fue incorporado al resumen
+                                    acumulado de la sesion
 
     Migracion liviana: si `sauzal.db` ya existia de una version anterior
     de este archivo (sin alguna de las columnas nuevas), se le agregan con
@@ -264,6 +360,15 @@ def startup():
           job_id TEXT PRIMARY KEY, model TEXT, prompt TEXT, status TEXT,
           assigned_node TEXT, result TEXT, error TEXT,
           created_at REAL, updated_at REAL);
+        CREATE TABLE IF NOT EXISTS sessions(
+          session_id TEXT PRIMARY KEY, tenant_id TEXT,
+          created_at REAL, last_used_at REAL, summary TEXT);
+        CREATE TABLE IF NOT EXISTS messages(
+          message_id TEXT PRIMARY KEY, session_id TEXT,
+          role TEXT, content TEXT, created_at REAL,
+          trivial INTEGER DEFAULT 0, token_estimate INTEGER,
+          summarized INTEGER DEFAULT 0);
+        CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, created_at);
         """)
         existing_job_cols = {r["name"] for r in conn.execute("PRAGMA table_info(jobs)").fetchall()}
         for column, coltype in (
@@ -276,6 +381,12 @@ def startup():
             ("client_os", "TEXT"),
             ("client_processor", "TEXT"),
             ("duration_ms", "REAL"),
+            ("session_id", "TEXT"),
+            ("kind", "TEXT DEFAULT 'chat'"),
+            ("context_tokens_estimate", "INTEGER"),
+            ("context_messages_used", "INTEGER"),
+            ("context_semantic_hits", "INTEGER"),
+            ("summarize_message_ids", "TEXT"),
         ):
             if column not in existing_job_cols:
                 conn.execute(f"ALTER TABLE jobs ADD COLUMN {column} {coltype}")
@@ -327,6 +438,9 @@ class Infer(BaseModel):
     client: str | None = None     # quien lo pide (dato libre, ej: hostname del cliente; no autenticado)
     client_os: str | None = None          # SO del cliente (dato libre, self-reportado)
     client_processor: str | None = None   # procesador/arquitectura del cliente (idem)
+    session_id: str | None = None         # opcional: si viene, este pedido pertenece a una
+                                           # conversacion con memoria (ver server/memory.py).
+                                           # Sin esto, el comportamiento es 100% el de siempre.
 
 class Result(Auth):
     """Body de POST /jobs/{job_id}/result: lo que devuelve el agente al terminar."""
@@ -510,35 +624,56 @@ def infer(req: Infer, request: Request):
          que un lock estricto).
 
     El nodo recien se entera del trabajo en su proximo POST /agent/pull.
+
+    Memoria de conversacion (solo si viene `session_id`):
+      1. Se valida que la sesion exista (404 si no).
+      2. Si el modelo NO es de imagen, `memory.build_context()` arma el
+         prompt final combinando resumen + memoria semantica + mensajes
+         recientes de esa sesion + el mensaje nuevo -- ESE prompt
+         combinado es el que se guarda en `jobs.prompt` y el que
+         efectivamente recibe el nodo. Para modelos de imagen se omite
+         (no tendria sentido inyectar una transcripcion de texto en un
+         prompt de imagen); el mensaje se guarda igual, para que el
+         historial de la sesion quede completo.
+      3. Recien DESPUES de armar el contexto se guarda el mensaje del
+         usuario (ver el aviso de orden en memory.build_context()).
+      4. Las metricas de contexto usadas quedan en la fila del job.
+
+    El nodo que ejecuta esto NUNCA se entera de que existe una sesion:
+    solo ve un prompt de texto, como cualquier otro job.
     """
     now=time.time()
     with db() as conn:
-        if req.node:
-            node=conn.execute("""
-              SELECT node_id FROM nodes
-              WHERE status='available' AND last_seen>? AND COALESCE(paused,0)=0
-                AND (node_id=? OR name=?)
-              ORDER BY last_seen DESC LIMIT 1
-            """,(now-30,req.node,req.node)).fetchone()
-        else:
-            node=conn.execute("""
-              SELECT node_id FROM nodes
-              WHERE status='available' AND last_seen>? AND COALESCE(paused,0)=0
-              ORDER BY last_seen DESC LIMIT 1
-            """,(now-30,)).fetchone()
+        node = _pick_available_node(conn, req.node)
         if not node:
             raise HTTPException(503,"No available Sauzal nodes")
+
+        final_prompt = req.prompt
+        ctx_tokens=ctx_messages=ctx_hits=None
+        if req.session_id:
+            session = memory.get_session(conn, req.session_id)
+            if not session:
+                raise HTTPException(404, "Session not found")
+            if not _is_image_model(req.model):
+                final_prompt, metrics = memory.build_context(conn, req.session_id, req.prompt)
+                ctx_tokens = metrics["context_tokens_estimate"]
+                ctx_messages = metrics["context_messages_used"]
+                ctx_hits = metrics["context_semantic_hits"]
+            memory.add_message(conn, req.session_id, "user", req.prompt)
+
         job_id=str(uuid.uuid4())
         ip = client_ip(request)
         conn.execute("""
           INSERT INTO jobs(
             job_id,model,prompt,status,assigned_node,client,
             client_ip,client_location,client_user_agent,client_os,client_processor,
+            session_id,kind,context_tokens_estimate,context_messages_used,context_semantic_hits,
             created_at,updated_at
-          ) VALUES(?,?,?,'queued',?,?,?,?,?,?,?,?,?)
+          ) VALUES(?,?,?,'queued',?,?,?,?,?,?,?,?,'chat',?,?,?,?,?)
         """,(
-            job_id,req.model,req.prompt,node["node_id"],req.client,
+            job_id,req.model,final_prompt,node["node_id"],req.client,
             ip,geolocate(ip),request.headers.get("user-agent"),req.client_os,req.client_processor,
+            req.session_id,ctx_tokens,ctx_messages,ctx_hits,
             now,now
         ))
         conn.execute("UPDATE nodes SET status='busy' WHERE node_id=?",(node["node_id"],))
@@ -572,6 +707,51 @@ def pull(req: Auth):
     return {"job":dict(job)}
 
 
+def _maybe_enqueue_summary(conn, session_id: str, model: str) -> None:
+    """
+    Si la sesion acumulo demasiados mensajes viejos sin resumir (ver
+    `memory.SUMMARIZE_TRIGGER`), encola un job INTERNO `kind='summarize'`
+    para comprimirlos, usando el mismo modelo que se viene usando en la
+    conversacion y el mismo mecanismo de seleccion de nodo que un pedido
+    normal (`_pick_available_node()`).
+
+    Si no hay ningun nodo disponible en este momento, no hace nada -- se
+    vuelve a evaluar la proxima vez que se guarde una respuesta de esa
+    sesion (no es critico que el resumen se genere de inmediato).
+
+    Tambien se abstiene si YA hay un resumen en curso (queued o running)
+    para esta sesion: sin este chequeo, una conversacion muy activa
+    podria disparar un job de resumen nuevo en cada turno mientras el
+    anterior todavia no termino, porque `pending` sigue creciendo hasta
+    que el resumen en curso efectivamente se complete y marque esos
+    mensajes como `summarized=1`.
+    """
+    pending = memory.messages_needing_summary(conn, session_id)
+    if len(pending) < memory.SUMMARIZE_TRIGGER:
+        return
+    already_running = conn.execute("""
+      SELECT 1 FROM jobs WHERE session_id=? AND kind='summarize'
+        AND status IN ('queued','running') LIMIT 1
+    """, (session_id,)).fetchone()
+    if already_running:
+        return
+    node = _pick_available_node(conn)
+    if not node:
+        return
+    session = memory.get_session(conn, session_id)
+    summary_prompt = memory.build_summary_prompt(session, pending)
+    now = time.time()
+    job_id = str(uuid.uuid4())
+    conn.execute("""
+      INSERT INTO jobs(job_id,model,prompt,status,assigned_node,session_id,kind,summarize_message_ids,created_at,updated_at)
+      VALUES(?,?,?,'queued',?,?,'summarize',?,?,?)
+    """, (
+        job_id, model, summary_prompt, node["node_id"], session_id,
+        json.dumps([m["message_id"] for m in pending]), now, now,
+    ))
+    conn.execute("UPDATE nodes SET status='busy' WHERE node_id=?", (node["node_id"],))
+
+
 @app.post("/jobs/{job_id}/result")
 def result(job_id: str, req: Result):
     """
@@ -580,11 +760,25 @@ def result(job_id: str, req: Result):
     libera al nodo (status='available') para que /infer pueda volver a
     asignarle trabajos.
 
+    Si el job exitoso pertenecia a una sesion:
+      - `kind='chat'`: la respuesta del asistente se guarda como mensaje
+        nuevo de esa sesion (memoria de corto plazo para el proximo
+        turno), y se evalua si hace falta disparar un resumen automatico
+        (`_maybe_enqueue_summary()`).
+      - `kind='summarize'`: el resultado ES el resumen -- se guarda en
+        `sessions.summary` (reemplazando el anterior, que ya estaba
+        incorporado en el prompt que genero este resumen nuevo) y se
+        marcan `summarized=1` los mensajes que cubria
+        (`jobs.summarize_message_ids`).
+
     No valida que el job_id realmente estuviera asignado a este node_id
     (posible mejora: chequear `assigned_node=?` en el UPDATE).
     """
     with db() as conn:
         authenticate(conn, req.node_id, req.token)
+        job = conn.execute(
+            "SELECT model,session_id,kind,summarize_message_ids FROM jobs WHERE job_id=?", (job_id,)
+        ).fetchone()
         status="completed" if req.success else "failed"
         conn.execute("""
           UPDATE jobs SET status=?,result=?,error=?,prompt_tokens=?,output_tokens=?,duration_ms=?,updated_at=? WHERE job_id=?
@@ -593,6 +787,27 @@ def result(job_id: str, req: Result):
             "UPDATE nodes SET status='available',last_seen=? WHERE node_id=?",
             (time.time(),req.node_id)
         )
+
+        if req.success and job and job["session_id"]:
+            try:
+                response_text = json.loads(req.result).get("response") if req.result else None
+            except json.JSONDecodeError:
+                response_text = None
+            if response_text:
+                if job["kind"] == "summarize":
+                    conn.execute(
+                        "UPDATE sessions SET summary=? WHERE session_id=?",
+                        (response_text, job["session_id"]),
+                    )
+                    ids = json.loads(job["summarize_message_ids"] or "[]")
+                    if ids:
+                        placeholders = ",".join("?" for _ in ids)
+                        conn.execute(
+                            f"UPDATE messages SET summarized=1 WHERE message_id IN ({placeholders})", ids
+                        )
+                else:
+                    memory.add_message(conn, job["session_id"], "assistant", response_text)
+                    _maybe_enqueue_summary(conn, job["session_id"], job["model"])
     return {"ok":True}
 
 
@@ -614,6 +829,79 @@ def get_job(job_id: str):
     if not job:
         raise HTTPException(404,"Job not found")
     return dict(job)
+
+
+# ============================================================
+# Sesiones de conversacion (memoria)
+# ============================================================
+#
+# Estos cuatro endpoints son la interfaz publica de la memoria de
+# conversacion (ver server/memory.py para la logica de recuperacion de
+# contexto). El uso tipico es:
+#
+#   1. POST /sessions                      -> {"session_id": "..."}
+#   2. POST /infer  {"session_id": "...", "prompt": "..."}   (repetido,
+#      potencialmente contra nodos distintos cada vez -- ver la logica de
+#      contexto en el propio /infer, mas abajo)
+#   3. DELETE /sessions/{id}               (cuando termina la conversacion)
+#
+# Una request a /infer SIN session_id sigue funcionando exactamente igual
+# que antes de que existiera este modulo (inferencia suelta, sin memoria).
+
+class SessionCreate(BaseModel):
+    """Body de POST /sessions. Todo opcional: alcanza con POST /sessions
+    con body vacio para el caso comun."""
+    tenant_id: str | None = None  # reservado para multi-tenant futuro, no se usa todavia
+
+
+@app.post("/sessions")
+def create_session(req: SessionCreate = SessionCreate()):
+    """Crea una sesion de conversacion nueva y devuelve su session_id."""
+    with db() as conn:
+        session_id = memory.create_session(conn, req.tenant_id)
+    return {"session_id": session_id}
+
+
+@app.get("/sessions/{session_id}")
+def get_session_info(session_id: str):
+    """
+    Info resumida de una sesion: cuando se creo, cuando se uso por
+    ultima vez, cuantos mensajes tiene, y su resumen acumulado (si ya se
+    genero uno). Util para debugging/monitoreo, no hace falta para el
+    flujo normal de un cliente.
+    """
+    with db() as conn:
+        session = memory.get_session(conn, session_id)
+        if not session:
+            raise HTTPException(404, "Session not found")
+        count = conn.execute(
+            "SELECT COUNT(*) AS n FROM messages WHERE session_id=?", (session_id,)
+        ).fetchone()["n"]
+    return {**dict(session), "message_count": count}
+
+
+@app.get("/sessions/{session_id}/messages")
+def get_session_messages(session_id: str):
+    """Historial completo de mensajes de una sesion, en orden
+    cronologico. Incluye los mensajes triviales y ya resumidos -- esto
+    devuelve el registro crudo completo, no lo que efectivamente se le
+    manda al modelo en cada inferencia (eso lo arma memory.build_context())."""
+    with db() as conn:
+        if not memory.get_session(conn, session_id):
+            raise HTTPException(404, "Session not found")
+        messages = [dict(r) for r in memory.list_messages(conn, session_id)]
+    return {"session_id": session_id, "messages": messages}
+
+
+@app.delete("/sessions/{session_id}")
+def delete_session(session_id: str):
+    """Borra la sesion Y todos sus mensajes -- aislamiento y borrado
+    completo, sin dejar rastro de memoria asociada a esa conversacion."""
+    with db() as conn:
+        if not memory.get_session(conn, session_id):
+            raise HTTPException(404, "Session not found")
+        memory.delete_session(conn, session_id)
+    return {"ok": True}
 
 
 # ============================================================
@@ -812,6 +1100,29 @@ def _client_row(c: dict, now: float) -> str:
     </tr>"""
 
 
+def _session_row(s: dict, now: float) -> str:
+    """
+    Fila <tr> de una sesion de conversacion para la tabla del panel.
+    `message_count` viene de un COUNT(*) separado (ver admin_panel()),
+    no de `sessions` -- esa tabla no guarda un contador propio.
+    """
+    summary = s.get("summary")
+    summary_preview = (summary[:60] + "…") if summary and len(summary) > 60 else (summary or "-")
+    return f"""
+    <tr>
+      <td><a href="/admin/sessions/{s['session_id']}">{s['session_id'][:8]}…</a></td>
+      <td>{s["message_count"]}</td>
+      <td title="{html.escape(summary or '')}">{html.escape(summary_preview)}</td>
+      <td>{_ago(s["created_at"], now)}</td>
+      <td>{_ago(s["last_used_at"], now)}</td>
+      <td class="actions">
+        <form method="post" action="/admin/sessions/{s['session_id']}/delete" onsubmit="return confirm('¿Borrar esta sesion y toda su memoria?')">
+          <button class="danger">Eliminar</button>
+        </form>
+      </td>
+    </tr>"""
+
+
 @app.get("/admin", response_class=HTMLResponse)
 def admin_panel():
     """
@@ -837,6 +1148,11 @@ def admin_panel():
                  client_user_agent, created_at
           FROM jobs WHERE client IS NOT NULL ORDER BY created_at DESC
         """).fetchall()]
+        sessions = [dict(r) for r in conn.execute("""
+          SELECT sessions.*, COUNT(messages.message_id) AS message_count
+          FROM sessions LEFT JOIN messages ON messages.session_id = sessions.session_id
+          GROUP BY sessions.session_id ORDER BY sessions.last_used_at DESC
+        """).fetchall()]
 
     # Agrupa por nombre de cliente en Python (no en SQL) para quedarse con
     # los datos del job MAS RECIENTE de cada uno (la lista ya viene
@@ -852,6 +1168,8 @@ def admin_panel():
         "<tr><td colspan='8'>No hay nodos registrados todavia.</td></tr>"
     clients_html = "".join(_client_row(c, now) for c in clients) or \
         "<tr><td colspan='6'>Todavia no hay pedidos de ningun cliente.</td></tr>"
+    sessions_html = "".join(_session_row(s, now) for s in sessions) or \
+        "<tr><td colspan='6'>Todavia no hay sesiones de conversacion.</td></tr>"
     jobs_html = "".join(_job_row(j, now) for j in jobs) or \
         "<tr><td colspan='10'>No hay trabajos todavia.</td></tr>"
     online_count = sum(1 for n in nodes if now - n["last_seen"] < 30)
@@ -881,7 +1199,7 @@ def admin_panel():
 </head>
 <body>
   <h1>Sauzal · Panel de administracion</h1>
-  <p class="summary">{len(nodes)} nodos registrados ({online_count} online) · {len(clients)} clientes distintos · {len(jobs)} trabajos mostrados (ultimos 200) · se actualiza sola cada 5s · click en un nombre para ver mas detalle</p>
+  <p class="summary">{len(nodes)} nodos registrados ({online_count} online) · {len(clients)} clientes distintos · {len(sessions)} sesiones de conversacion · {len(jobs)} trabajos mostrados (ultimos 200) · se actualiza sola cada 5s · click en un nombre para ver mas detalle</p>
 
   <h2>Nodos</h2>
   <table>
@@ -893,6 +1211,12 @@ def admin_panel():
   <table>
     <tr><th>Nombre</th><th>IP (ubicacion)</th><th>Origen</th><th>SO</th><th>Trabajos</th><th>Ultimo pedido hace</th></tr>
     {clients_html}
+  </table>
+
+  <h2>Sesiones de conversacion</h2>
+  <table>
+    <tr><th>Session</th><th>Mensajes</th><th>Resumen</th><th>Creada hace</th><th>Ultimo uso hace</th><th>Acciones</th></tr>
+    {sessions_html}
   </table>
 
   <h2>Trabajos</h2>
@@ -1159,6 +1483,107 @@ def admin_client_detail(client_name: str):
   </table>
 </body>
 </html>""")
+
+
+@app.get("/admin/sessions/{session_id}", response_class=HTMLResponse)
+def admin_session_detail(session_id: str):
+    """
+    Pagina de detalle de UNA sesion de conversacion: su resumen completo
+    (si ya se genero uno), el historial completo de mensajes (marcando
+    cuales son triviales o ya fueron incorporados al resumen), y los
+    jobs que la fueron atendiendo -- potencialmente varios nodos
+    distintos a lo largo de la conversacion, que es justamente lo que
+    este modulo de memoria esta pensado para permitir.
+    """
+    now = time.time()
+    with db() as conn:
+        session = memory.get_session(conn, session_id)
+        if not session:
+            raise HTTPException(404, "Session not found")
+        session = dict(session)
+        messages = [dict(r) for r in memory.list_messages(conn, session_id)]
+        jobs = [dict(r) for r in conn.execute("""
+          SELECT jobs.*, nodes.name AS node_name FROM jobs
+          LEFT JOIN nodes ON nodes.node_id = jobs.assigned_node
+          WHERE jobs.session_id=? ORDER BY jobs.created_at DESC
+        """, (session_id,)).fetchall()]
+
+    def _message_row(m: dict) -> str:
+        flags = []
+        if m["trivial"]:
+            flags.append("trivial")
+        if m["summarized"]:
+            flags.append("resumido")
+        flags_html = f' <span style="color:#9aa0a6">({", ".join(flags)})</span>' if flags else ""
+        role_icon = "🧑" if m["role"] == "user" else "🤖"
+        return f"""
+        <tr>
+          <td>{role_icon} {html.escape(m["role"])}</td>
+          <td>{html.escape(m["content"])}{flags_html}</td>
+          <td>{m["token_estimate"]}</td>
+          <td>{_ago(m["created_at"], now)}</td>
+        </tr>"""
+
+    messages_html = "".join(_message_row(m) for m in messages) or \
+        "<tr><td colspan='4'>Sin mensajes todavia.</td></tr>"
+    jobs_html = "".join(_job_row(j, now) for j in jobs) or \
+        "<tr><td colspan='10'>Sin jobs asociados.</td></tr>"
+
+    return HTMLResponse(f"""<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="refresh" content="10">
+<title>Sauzal · Sesion {session_id[:8]}</title>
+<style>
+  body {{ font-family: system-ui, sans-serif; background:#0f1115; color:#e6e6e6; margin:2rem; }}
+  h1 {{ font-size:1.4rem; margin-bottom:0.2rem; }}
+  h2 {{ font-size:1.1rem; margin-top:2rem; color:#9aa0a6; }}
+  table {{ width:100%; border-collapse: collapse; margin-top:0.5rem; }}
+  th, td {{ text-align:left; padding:0.5rem 0.7rem; border-bottom:1px solid #2a2d34; font-size:0.9rem; vertical-align:top; }}
+  th {{ color:#9aa0a6; font-weight:600; }}
+  a {{ color:#7fb0ff; }}
+  .summary {{ color:#9aa0a6; font-size:0.9rem; }}
+  .card {{ background:#171a20; border:1px solid #2a2d34; border-radius:8px; padding:1rem; margin-top:1rem; }}
+  button {{ background:#2a2d34; color:#e6e6e6; border:1px solid #3a3d44; border-radius:4px; padding:0.3rem 0.6rem; cursor:pointer; font-size:0.8rem; }}
+  button.danger:hover {{ background:#5c2020; border-color:#7a2a2a; }}
+</style>
+</head>
+<body>
+  <p><a href="/admin">← Volver al panel</a></p>
+  <h1>Sesion {session_id}</h1>
+  <p class="summary">{len(messages)} mensajes · creada hace {_ago(session["created_at"], now)} · ultimo uso hace {_ago(session["last_used_at"], now)}</p>
+
+  <div class="card">
+    <b>Resumen acumulado (memoria de largo plazo):</b>
+    <p>{html.escape(session["summary"]) if session["summary"] else "Todavia no se genero ningun resumen (hace falta que se acumulen varios mensajes viejos, ver memory.SUMMARIZE_TRIGGER)."}</p>
+    <form method="post" action="/admin/sessions/{session_id}/delete" onsubmit="return confirm('¿Borrar esta sesion y toda su memoria? No se puede deshacer.')">
+      <button class="danger">Eliminar sesion completa</button>
+    </form>
+  </div>
+
+  <h2>Mensajes</h2>
+  <table>
+    <tr><th>Rol</th><th>Contenido</th><th>Tokens (aprox)</th><th>Hace</th></tr>
+    {messages_html}
+  </table>
+
+  <h2>Jobs de esta sesion</h2>
+  <table>
+    <tr><th>Job</th><th>Modelo</th><th>Prompt</th><th>Cliente</th><th>Estado</th><th>Nodo</th><th>Tokens (in/out)</th><th>Duracion</th><th>Creado hace</th><th>Acciones</th></tr>
+    {jobs_html}
+  </table>
+</body>
+</html>""")
+
+
+@app.post("/admin/sessions/{session_id}/delete")
+def admin_delete_session(session_id: str):
+    """Borra la sesion y todos sus mensajes desde el panel (misma logica
+    que DELETE /sessions/{{id}}, expuesta como boton en vez de API)."""
+    with db() as conn:
+        memory.delete_session(conn, session_id)
+    return RedirectResponse("/admin", status_code=303)
 
 
 @app.post("/admin/nodes/{node_id}/delete")

@@ -41,6 +41,7 @@ cómputo pesado pasa en la máquina del nodo remoto.
 | Archivo | Rol | Dónde corre |
 |---|---|---|
 | `server/main.py` | Control plane (API FastAPI + base SQLite) | Un solo lugar central (tu PC, o idealmente un VPS) |
+| `server/memory.py` | Memoria de conversación: sesiones, mensajes, recuperación semántica (ver sección 6) | Se importa dentro de `main.py`, no se corre solo |
 | `client/infer.py` | Pide una inferencia y espera el resultado | Cualquier PC que quiera *usar* la red |
 | `agent/agent.py` | Se conecta al servidor, recibe trabajos y los ejecuta | Cada nodo que *aporta* GPU |
 | `agent/comfy.py` | Módulo del agente: backend de generación de imagen (ComfyUI) | Se importa dentro de `agent.py`, no se corre solo |
@@ -62,6 +63,10 @@ una API HTTP con estos endpoints:
 - `POST /agent/pull` — un nodo pregunta si tiene trabajo asignado.
 - `POST /jobs/{id}/result` — un nodo entrega el resultado (o el error).
 - `GET /jobs/{id}` — un cliente consulta el estado/resultado de un pedido.
+- `POST /sessions` — crea una sesión de conversación, devuelve `session_id`.
+- `GET /sessions/{id}` — info resumida de una sesión (mensajes, resumen).
+- `GET /sessions/{id}/messages` — historial completo de mensajes.
+- `DELETE /sessions/{id}` — borra la sesión y toda su memoria asociada.
 - `GET /bench/payload` — devuelve un bloque fijo de 2MB; un nodo lo
   descarga una sola vez al registrarse para medir su velocidad de red
   hacia el servidor.
@@ -84,6 +89,10 @@ una API HTTP con estos endpoints:
   parece un navegador o un script, y su historial completo de trabajos.
   No existe una tabla `clients`: esta página agrega la tabla `jobs` por
   el campo `client` (ver sección 5).
+- `GET /admin/sessions/{id}` — detalle de una sesión de conversación:
+  resumen acumulado, historial completo de mensajes, y los jobs que la
+  fueron atendiendo (ver sección 6).
+- `POST /admin/sessions/{id}/delete` — borra una sesión desde el panel.
 
 Todo lo de `/admin*` es sin autenticación (igual que el resto del
 servidor) — pensado para uso en LAN/desarrollo, no para exponer a
@@ -303,3 +312,158 @@ como un nodo nuevo. Si se borra este archivo (o se corre con
 NUEVA en la tabla `nodes` — por eso en las pruebas de este proyecto a
 veces se ven nodos viejos duplicados y `offline` en `GET /nodes`: son
 registros de sesiones anteriores que nunca se limpian solos.
+
+## 6. Memoria de conversación (sesiones)
+
+Toda la lógica vive en **`server/memory.py`** — un módulo nuevo, sin
+dependencias externas, que le da a Sauzal la capacidad de mantener una
+conversación con contexto **aunque cada mensaje lo procese un nodo/GPU
+distinto**. El agente no cambió ni una línea para soportar esto: sigue
+recibiendo un prompt de texto plano como siempre.
+
+### La idea central
+
+El servidor arma, antes de encolar el job, un prompt "aplanado" que
+combina: un resumen de la conversación (si ya se generó uno), los
+mensajes viejos semánticamente relevantes a la pregunta actual, y los
+últimos mensajes recientes tal cual. **Ese prompt combinado es el que
+recibe el nodo** — para el nodo es un prompt de texto suelto, igual que
+cualquier otro `/infer`. El nodo A nunca se entera de que existe una
+sesión ni necesita recordar nada para que el nodo B pueda continuar la
+misma conversación después.
+
+```
+Turno 1 (nodo A):
+  Cliente -> POST /infer {session_id, prompt:"Mi auto favorito es un BMW Isetta"}
+  Servidor guarda el mensaje, arma el job (sin contexto previo: es el primero)
+  Nodo A ejecuta, responde -> servidor guarda la respuesta como mensaje
+
+  ... pasan varios turnos, el mensaje sale de la ventana reciente ...
+
+Turno N (nodo B, un nodo DISTINTO):
+  Cliente -> POST /infer {session_id, prompt:"Cual es mi auto favorito?"}
+  Servidor busca en los mensajes viejos de la sesion los mas relevantes
+  a "Cual es mi auto favorito?" -> encuentra el mensaje del BMW Isetta
+  Servidor arma el prompt final:
+      "Contexto relevante de mensajes anteriores:
+       - Mi auto favorito es un BMW Isetta
+
+       Conversacion reciente:
+       ...
+       Usuario: Cual es mi auto favorito?
+       Asistente:"
+  ESE prompt (no el original) es lo que recibe el nodo B.
+  El nodo B responde "BMW Isetta" sin haber visto nunca el turno 1.
+```
+
+Esto está probado en vivo (ver "Cómo probarlo" más abajo) y con un test
+automático (`tests/test_sessions.py::test_conversation_survives_across_different_nodes`)
+que simula exactamente este escenario con dos nodos falsos.
+
+### Motor de similitud: TF-IDF, no un modelo de embeddings
+
+Se evaluó agregar un modelo de embeddings neuronal (por ejemplo, via
+`/api/embeddings` de Ollama), pero se descartó para la primera versión:
+obligaría al SERVIDOR (que puede correr en una máquina sin GPU) a
+depender de que haya un nodo disponible solo para vectorizar texto, lo
+cual complica la arquitectura para un beneficio marginal en conversaciones
+del tamaño típico de un chat (decenas o cientos de mensajes, no miles).
+
+En cambio, `memory.py` implementa **TF-IDF + similitud coseno en Python
+puro**, sin ninguna librería nueva: es el modelo vectorial clásico de
+recuperación de información (siempre fue "semántico/vectorial" en el
+sentido de la IR clásica, aunque no sea una red neuronal), y se recalcula
+al vuelo en cada búsqueda porque el corpus es chico (los mensajes de UNA
+sola sesión). Si en el futuro hace falta más precisión, alcanza con
+reemplazar la función `_vectorize()` de `memory.py` por embeddings reales
+sin tocar el resto del diseño — toda la recuperación pasa por
+`top_similar()`.
+
+### Las tres capas de memoria
+
+| Capa | Qué es | Cómo se arma |
+|---|---|---|
+| **Corto plazo** | Los últimos `SHORT_TERM_WINDOW` (6) mensajes, tal cual, sin resumir | Se incluyen siempre en el prompt |
+| **Semántica/vectorial** | Hasta `SEMANTIC_TOP_K` (3) mensajes viejos, elegidos por similitud TF-IDF con la pregunta actual | `memory.top_similar()`, con un piso de similitud (`SEMANTIC_MIN_SCORE`) para no traer ruido |
+| **Largo plazo (resumen)** | Un resumen acumulado de TODOS los mensajes viejos de la sesión | Generado automáticamente por un job interno cuando hay demasiados mensajes sin resumir (ver abajo) |
+
+Los mensajes triviales ("hola", "gracias", "ok" — ver `memory.is_trivial()`)
+se guardan igual (hacen falta para la memoria de corto plazo), pero se
+excluyen del banco de candidatos para la búsqueda semántica.
+
+### Resumen automático de conversaciones largas
+
+Cuando una sesión acumula `SUMMARIZE_TRIGGER` (12) o más mensajes viejos
+sin resumir, el servidor encola **un job interno `kind='summarize'`**
+usando exactamente el mismo mecanismo que cualquier otro job: se le
+asigna a un nodo disponible (`_pick_available_node()`), el nodo lo
+procesa como un prompt de texto más (le pide "resumí esta conversación
+preservando lo importante"), y cuando el resultado vuelve por el mismo
+`POST /jobs/{id}/result` de siempre, el servidor detecta que es un job de
+resumen y guarda el resultado en `sessions.summary` en vez de crear un
+mensaje nuevo, marcando los mensajes cubiertos como `summarized=1`. Hay
+una guarda (`_maybe_enqueue_summary()`) para no encolar un resumen nuevo
+si ya hay uno en curso para esa sesión.
+
+### Métricas de contexto por job
+
+Cada job de tipo `chat` que pertenece a una sesión guarda cuánto contexto
+se le inyectó: `context_tokens_estimate` (aproximado, ~4 caracteres por
+token — no hay tokenizador real del lado del servidor), `context_messages_used`
+(cuántos mensajes de la ventana reciente entraron) y `context_semantic_hits`
+(cuántos mensajes viejos se recuperaron por similitud). Se pueden ver en
+`/admin` y en `GET /jobs/{id}`.
+
+### Aislamiento y borrado
+
+Todo se filtra por `session_id` — no hay forma de que una sesión vea
+mensajes de otra (probado en `test_sessions_are_isolated_from_each_other`).
+`DELETE /sessions/{id}` (o el botón "Eliminar" en `/admin/sessions/{id}`)
+borra la sesión y TODOS sus mensajes sin dejar rastro. La columna
+`sessions.tenant_id` queda reservada para el día que haga falta aislar
+sesiones por cliente/organización — hoy siempre es `NULL` y no filtra
+nada, pero el esquema ya la tiene para no requerir una migración futura.
+
+### Compatibilidad con lo existente
+
+Un `POST /infer` **sin** `session_id` funciona exactamente igual que
+antes de que existiera este módulo: el prompt no se toca, no se crea
+ningún mensaje, `jobs.session_id` queda `NULL`. Esto está cubierto por
+`test_stateless_infer_is_unaffected_by_sessions`. Los modelos de imagen
+tampoco reciben contexto conversacional inyectado (no tendría sentido
+mezclar una transcripción de texto con un prompt de imagen), aunque el
+mensaje se sigue guardando para que el historial de la sesión quede
+completo.
+
+### Cómo probarlo
+
+**A) Automático** (no necesita GPU ni Ollama — simula nodos falsos):
+```powershell
+cd Sauzal
+pip install -r requirements-dev.txt
+pytest tests/ -v
+```
+
+**B) En vivo, con un nodo real** (repite el caso del BMW Isetta):
+```powershell
+# 1. Crear una sesión y contar el dato
+python client\infer.py --server http://IP_DEL_SERVIDOR:8000 --model gemma3:4b \
+    --new-session --prompt "Mi auto favorito es un BMW Isetta"
+# (anotar el session_id que imprime)
+
+# 2. Un par de turnos de relleno, para sacar el dato de la ventana reciente
+python client\infer.py --server http://IP_DEL_SERVIDOR:8000 --model gemma3:4b \
+    --session SESSION_ID --prompt "Decime un numero al azar"
+# (repetir 2-3 veces mas)
+
+# 3. Preguntar por el dato -- puede ejecutarlo cualquier nodo disponible
+python client\infer.py --server http://IP_DEL_SERVIDOR:8000 --model gemma3:4b \
+    --session SESSION_ID --prompt "Cual es mi auto favorito?"
+```
+El modelo debería responder "BMW Isetta" (o similar) sin que el prompt
+de este último pedido lo mencione explícitamente. Para confirmar que
+realmente vino de la memoria semántica (y no de casualidad), revisar
+`GET /jobs/{job_id}` de ese último pedido: el campo `prompt` va a tener
+una sección "Contexto relevante de mensajes anteriores" con la frase del
+BMW Isetta, y `context_semantic_hits` va a ser mayor a 0. También se
+puede ver todo desde `/admin/sessions/{session_id}` en el navegador.

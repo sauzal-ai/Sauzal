@@ -1,0 +1,5 @@
+# Dependencias SOLO para correr los tests (tests/) -- no hacen falta
+# para correr el servidor/agente/cliente en produccion, por eso estan
+# separadas del requirements.txt principal.
+pytest==9.1.1
+httpx==0.28.1
