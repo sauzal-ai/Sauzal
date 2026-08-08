@@ -46,6 +46,7 @@ class Heartbeat(Auth):
 class Infer(BaseModel):
     model: str = "gemma3:4b"
     prompt: str = Field(min_length=1)
+    node: str | None = None
 
 class Result(Auth):
     success: bool
@@ -104,11 +105,18 @@ def list_nodes():
 def infer(req: Infer):
     now=time.time()
     with db() as conn:
-        node=conn.execute("""
-          SELECT node_id FROM nodes
-          WHERE status='available' AND last_seen>?
-          ORDER BY last_seen DESC LIMIT 1
-        """,(now-30,)).fetchone()
+        if req.node:
+            node=conn.execute("""
+              SELECT node_id FROM nodes
+              WHERE status='available' AND last_seen>? AND (node_id=? OR name=?)
+              ORDER BY last_seen DESC LIMIT 1
+            """,(now-30,req.node,req.node)).fetchone()
+        else:
+            node=conn.execute("""
+              SELECT node_id FROM nodes
+              WHERE status='available' AND last_seen>?
+              ORDER BY last_seen DESC LIMIT 1
+            """,(now-30,)).fetchone()
         if not node:
             raise HTTPException(503,"No available Sauzal nodes")
         job_id=str(uuid.uuid4())
@@ -153,7 +161,11 @@ def result(job_id: str, req: Result):
 @app.get("/jobs/{job_id}")
 def get_job(job_id: str):
     with db() as conn:
-        job=conn.execute("SELECT * FROM jobs WHERE job_id=?",(job_id,)).fetchone()
+        job=conn.execute("""
+          SELECT jobs.*, nodes.name AS node_name FROM jobs
+          LEFT JOIN nodes ON nodes.node_id = jobs.assigned_node
+          WHERE jobs.job_id=?
+        """,(job_id,)).fetchone()
     if not job:
         raise HTTPException(404,"Job not found")
     return dict(job)
