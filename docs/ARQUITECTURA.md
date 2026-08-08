@@ -62,11 +62,32 @@ una API HTTP con estos endpoints:
 - `POST /agent/pull` — un nodo pregunta si tiene trabajo asignado.
 - `POST /jobs/{id}/result` — un nodo entrega el resultado (o el error).
 - `GET /jobs/{id}` — un cliente consulta el estado/resultado de un pedido.
+- `GET /bench/payload` — devuelve un bloque fijo de 2MB; un nodo lo
+  descarga una sola vez al registrarse para medir su velocidad de red
+  hacia el servidor.
 - `GET /admin` — panel web (HTML) para ver todos los nodos y trabajos en
   vivo, y hacer cambios manuales: eliminar un nodo, forzarlo de vuelta a
-  "available" si quedó colgado en "busy", o eliminar un trabajo. Sin
-  autenticación (igual que el resto del servidor) — pensado para uso en
-  LAN/desarrollo, no para exponer a internet sin agregarle protección.
+  "available" si quedó colgado en "busy", pausarlo/reactivarlo, o
+  eliminar un trabajo.
+- `GET /admin/nodes/{id}` — página de detalle de un nodo puntual: VRAM,
+  RAM, driver, motor de cómputo, versiones, benchmark, latencia,
+  velocidad de red, temperatura/consumo en vivo, energía acumulada +
+  costo estimado, IP/ubicación, y su historial de trabajos fallidos.
+- `POST /admin/nodes/{id}/pause` y `/resume` — pausar/reactivar
+  manualmente un nodo (deja de recibir trabajos aunque esté online).
+- `POST /admin/nodes/{id}/price` — fija el precio de electricidad
+  ($/kWh) de ese nodo, usado para estimar el costo eléctrico.
+- `POST /admin/nodes/{id}/reset-energy` — reinicia a cero el contador de
+  energía acumulada de un nodo.
+- `GET /admin/clients/{nombre}` — página de detalle de un cliente
+  puntual: IP, ubicación, sistema operativo, procesador, si el origen
+  parece un navegador o un script, y su historial completo de trabajos.
+  No existe una tabla `clients`: esta página agrega la tabla `jobs` por
+  el campo `client` (ver sección 5).
+
+Todo lo de `/admin*` es sin autenticación (igual que el resto del
+servidor) — pensado para uso en LAN/desarrollo, no para exponer a
+internet sin agregarle protección.
 
 ### 2.2 `client/infer.py` — el consumidor
 
@@ -155,7 +176,14 @@ ollama pull gemma3:4b
 cd Sauzal
 pip install -r agent/requirements.txt
 python agent\agent.py --server http://IP_DEL_SERVIDOR:8000 --name mi-nodo --register
+# Para que arranque pausado (no recibe trabajos hasta reactivarlo en /admin):
+python agent\agent.py --server http://IP_DEL_SERVIDOR:8000 --name mi-nodo --register --paused
 ```
+Al registrarse, el agente corre una vez un benchmark fijo (Ollama y/o
+ComfyUI, según lo que tenga disponible) y mide su velocidad de red hacia
+el servidor — por eso el primer registro puede tardar unos segundos más
+que los siguientes arranques.
+
 Si en cambio es un Pod de RunPod con la imagen Docker de este repo, no
 hay que instalar nada a mano: solo correr el Pod con la imagen
 `usuario/sauzal-node:latest` y la variable de entorno `SAUZAL_SERVER`
@@ -191,7 +219,31 @@ con `CREATE TABLE IF NOT EXISTS`). Son solo dos tablas.
 | `token` | TEXT | Servidor | Al registrar, genera un `uuid4()` nuevo. Es la "contraseña" del nodo: el agente la guarda en `agent/agent_config.json` y la manda en cada llamada autenticada (heartbeat, pull, result) para probar que es quien dice ser. |
 | `status` | TEXT (`available` / `busy`) | Servidor | Se pone en `available` al registrar; el propio servidor lo pasa a `busy` cuando le asigna un job (`POST /infer`) y de vuelta a `available` cuando el agente entrega el resultado (`POST /jobs/{id}/result`). También se sobreescribe con lo que mande el agente en cada `POST /nodes/heartbeat` (normalmente siempre manda `"available"`). |
 | `last_seen` | REAL (timestamp epoch) | Servidor | Se actualiza al registrar, en cada `POST /nodes/heartbeat` (cada ~2s, mientras el agente esté corriendo), y también al entregar un resultado. Se usa para calcular si un nodo está `online` (diferencia menor a 30s respecto a "ahora") tanto en `GET /nodes` como al elegir nodo en `POST /infer`. |
-| `capabilities` | TEXT (JSON serializado) | Servidor, con el dato que manda el agente | Al registrar, y refrescado en cada heartbeat si el agente manda un valor nuevo. Contiene: `hostname`, `os`, `gpu` (salida de `nvidia-smi`, vacío si no es NVIDIA), `ollama_models` (lista de modelos de texto disponibles), `image_models` (lista de modelos de imagen disponibles) y `services` (booleanos `ollama`/`comfyui`, resumen de si hay algo en las dos listas anteriores). |
+| `capabilities` | TEXT (JSON serializado) | Servidor, con el dato que manda el agente | Al registrar, y refrescado en cada heartbeat. Ver el detalle completo de campos más abajo. |
+| `paused` | INTEGER (0/1) | Servidor, con el valor inicial que manda el agente (`--paused`) o una acción manual en `/admin` | Al registrar (valor inicial) y en `POST /admin/nodes/{id}/pause`\|`/resume`. Los heartbeats normales **nunca** tocan esta columna a propósito, para que una pausa hecha desde el panel no se pierda mientras el agente sigue mandando heartbeats. `/infer` excluye siempre los nodos con `paused=1`, aunque estén online. |
+| `price_kwh` | REAL | Servidor, cargado a mano en `/admin` | En `POST /admin/nodes/{id}/price`. `NULL` hasta que se configure — sin esto no se puede estimar costo, solo se ve el consumo en W. |
+| `energy_wh` | REAL | Servidor, acumulando lo que manda el agente en cada heartbeat | En cada `POST /nodes/heartbeat` se suma `energy_wh_delta` (consumo instantáneo × tiempo transcurrido desde el heartbeat anterior). Es una **estimación**, no un medidor real, y solo se acumula en nodos donde se puede leer el consumo (NVIDIA vía `nvidia-smi`; en otras GPUs queda en 0 para siempre). Se puede reiniciar a mano con `POST /admin/nodes/{id}/reset-energy`. |
+| `latency_ms` | REAL | Servidor, con el dato que manda el agente | En cada `POST /nodes/heartbeat`. Es el tiempo de ida y vuelta del heartbeat ANTERIOR (medido por el propio agente) — sirve como proxy de qué tan lejos/lenta está la conexión de ese nodo con el servidor. |
+| `ip_address` | TEXT | Servidor, calculada de la conexión HTTP | Al registrar y en cada heartbeat. Ver `client_ip()`: usa el header `CF-Connecting-IP` (Cloudflare) o `X-Forwarded-For` si existen, si no la IP directa de la conexión TCP. **El agente no manda ni puede falsificar este campo.** |
+| `location` | TEXT | Servidor, resuelta a partir de `ip_address` | Al registrar y en cada heartbeat (cacheada por IP, ver `geolocate()`), consultando el servicio externo gratuito `ip-api.com`. `NULL` si la IP es privada/LAN (127.0.0.1, 192.168.x.x, etc.) o si la consulta externa falla. |
+
+**Sobre el envío de IPs a un servicio externo:** `geolocate()` manda la IP pública (nunca las privadas) a `ip-api.com` para resolver ciudad/país. Es una decisión consciente de diseño, confirmada explícitamente al implementar esta función — si en algún momento se quiere sacar esa dependencia externa, alcanza con hacer que `geolocate()` devuelva siempre `None`.
+
+**Los campos dentro de `capabilities` (JSON armado por `agent.py::capabilities()`):**
+
+| Campo | Qué es | Cómo se obtiene | Limitación |
+|---|---|---|---|
+| `hostname`, `os` | Identifican la máquina | `socket`/`platform` de Python | — |
+| `gpu` | Nombre(s) de GPU | `nvidia-smi` si es NVIDIA; si no, WMI en Windows (`Win32_VideoController`) | En Linux sin NVIDIA queda vacío (no se agregó una dependencia extra para eso) |
+| `ollama_models`, `image_models`, `services` | Qué modelos/backends tiene activos | `GET /api/tags` de Ollama y `comfy.py::available()` | — |
+| `vram_total_mb`, `vram_used_mb` | VRAM de la GPU | `nvidia-smi`; si no hay NVIDIA, se usa `/system_stats` de ComfyUI (VRAM vista por PyTorch) como alternativa | `NULL` si no hay NVIDIA y ComfyUI tampoco está corriendo |
+| `ram_total_mb`, `ram_used_mb` | RAM del sistema (no de la GPU) | WMI en Windows / `/proc/meminfo` en Linux | Es una **foto tomada al arrancar el agente**, no se refresca en cada heartbeat (para no pagar el costo de esa consulta cada 2s) |
+| `driver_version` | Versión del driver de la GPU | `nvidia-smi`; si no, WMI en Windows | `NULL` en Linux sin NVIDIA |
+| `compute_backend` | Motor de cómputo estimado (`CUDA`, `ROCm/Vulkan`, `Vulkan/oneAPI`, `CPU`) | Heurística según qué GPU se detectó | Es una estimación, no 100% autoritativa |
+| `ollama_version`, `comfy_python_version` | Versiones de software | `GET /api/version` de Ollama; `/system_stats` de ComfyUI | `NULL` si el backend correspondiente no está activo |
+| `benchmark` | Desempeño real medido (`tokens_per_sec` y/o `image_seconds`) | Se corre **una sola vez**, al registrarse: un prompt fijo a Ollama y/o una generación mínima en ComfyUI | Agrega demora al primer registro; no se vuelve a medir salvo que el agente se reinicie |
+| `network_mbps` | Velocidad de red hacia el servidor | Descarga única de `GET /bench/payload` (2MB) al registrarse | Mide contra el servidor Sauzal, no es un speedtest genérico |
+| `gpu_temp_c`, `gpu_power_w` | Temperatura y consumo en vivo | `nvidia-smi`, recalculado en cada heartbeat | `NULL` en GPUs no-NVIDIA (sin herramienta estándar disponible sin dependencias extra) |
 
 ### Tabla `jobs` — un registro por cada pedido de inferencia
 
@@ -203,17 +255,43 @@ con `CREATE TABLE IF NOT EXISTS`). Son solo dos tablas.
 | `status` | TEXT (`queued`→`running`→`completed`\|`failed`) | Servidor | `queued` al crear (`POST /infer`); `running` cuando el nodo asignado hace *pull* exitoso del trabajo (`POST /agent/pull`); `completed` o `failed` cuando el nodo entrega el resultado (`POST /jobs/{id}/result`, según el campo `success` que mande). |
 | `assigned_node` | TEXT (FK lógica a `nodes.node_id`) | Servidor | Al crear el pedido: es el `node_id` que el servidor eligió (el nodo disponible visto más recientemente, o el pedido explícitamente por el cliente vía el campo `node`). No cambia después — si ese nodo se cae a mitad de camino, el job queda huérfano (no hay reintento ni reasignación automática). |
 | `client` | TEXT | Servidor, con el dato que manda el cliente | Al crear el pedido (`POST /infer`, campo `client`). Identifica "quién lo pidió" — por defecto, `client/infer.py` manda su propio hostname. **No es una identidad autenticada**: cualquiera puede mandar el valor que quiera, es solo informativo (mismo criterio de confianza que el `name` de los nodos). |
+| `client_ip` | TEXT | Servidor, calculada de la conexión HTTP | Al crear el pedido, con `client_ip()` (mismo mecanismo que usan los nodos). No lo puede falsificar el cliente. |
+| `client_location` | TEXT | Servidor, resuelta a partir de `client_ip` | Al crear el pedido, vía `geolocate()` (cacheada por IP). `NULL` en LAN o si falla la consulta externa. |
+| `client_user_agent` | TEXT | Servidor, del header `User-Agent` | Al crear el pedido. Lo manda automáticamente CUALQUIER cliente HTTP sin que nadie lo declare a mano — sirve para distinguir un navegador (`Mozilla/...`) de un script (`python-requests/...`, `curl/...`) vía la heurística `_client_origin()`. |
+| `client_os`, `client_processor` | TEXT | Servidor, con el dato que manda el cliente | Al crear el pedido. `client/infer.py` los arma con el módulo `platform` de Python. **No autenticados**, mismo criterio que `client`. |
 | `result` | TEXT (JSON serializado) | El AGENTE, vía el servidor | Al entregar el resultado (`POST /jobs/{id}/result`), solo si `success=true`. El JSON lo arma el agente: `agent.py::infer()` para texto (con `response`, tokens, duraciones) o `agent/comfy.py::generate()` para imagen (con las imágenes en base64, dimensiones, seed, etc). |
 | `error` | TEXT | El AGENTE, vía el servidor | Al entregar el resultado, solo si `success=false`. Es el `repr()` de la excepción que capturó `agent.py` al ejecutar el trabajo. |
 | `prompt_tokens` | INTEGER | El AGENTE, vía el servidor | Al entregar el resultado. Solo en jobs de **texto**: `agent.py` extrae `prompt_tokens` del JSON que ya arma `infer()` (viene de Ollama, campo `prompt_eval_count`). En jobs de **imagen** queda `NULL` (ComfyUI no tiene concepto de tokens). |
 | `output_tokens` | INTEGER | El AGENTE, vía el servidor | Ídem `prompt_tokens`, pero de salida (`eval_count` de Ollama). `NULL` en jobs de imagen. |
+| `duration_ms` | REAL | El AGENTE, vía el servidor | Al entregar el resultado, tanto si `success=true` como `success=false`. Es el tiempo real que tardó `execute(job)` de punta a punta, cronometrado por el propio agente — a diferencia de `prompt_tokens`/`output_tokens`, funciona igual para jobs de texto **e imagen**, y también queda registrado cuánto tardó un job que terminó fallando. |
 | `created_at` | REAL (timestamp epoch) | Servidor | Al crear el pedido. |
 | `updated_at` | REAL (timestamp epoch) | Servidor | Se actualiza cuando el job pasa a `running` (pull) y de nuevo cuando pasa a `completed`/`failed` (result). |
 
-> Estas tres columnas (`client`, `prompt_tokens`, `output_tokens`) se
-> agregaron después de la versión inicial del esquema. El servidor migra
-> solo cualquier `sauzal.db` vieja al arrancar (`ALTER TABLE` si faltan),
-> así que no hace falta borrar la base para actualizar.
+> `client`/`prompt_tokens`/`output_tokens`/`duration_ms`/`client_ip`/
+> `client_location`/`client_user_agent`/`client_os`/`client_processor`
+> (en `jobs`) y
+> `paused`/`price_kwh`/`energy_wh`/`latency_ms`/`ip_address`/`location`
+> (en `nodes`) se agregaron después de la versión inicial del esquema.
+> El servidor migra sola cualquier `sauzal.db` vieja al arrancar
+> (`ALTER TABLE` si faltan columnas), así que no hace falta borrar la
+> base para actualizar.
+
+### Ni el "historial de fallas" ni "clientes" son tablas aparte
+
+La página de detalle de un nodo (`/admin/nodes/{id}`) muestra sus
+trabajos fallidos, pero eso NO se guarda en una columna nueva: se
+calcula al vuelo con `SELECT ... FROM jobs WHERE assigned_node=? AND
+status='failed'`.
+
+De la misma forma, **no existe una tabla `clients`**. Un "cliente" no se
+registra ni manda heartbeat (a diferencia de un nodo) — es solo un
+nombre libre que viaja en cada `POST /infer`. La tabla de Clientes en
+`/admin` y la página `/admin/clients/{nombre}` se arman agregando
+`jobs` por la columna `client` (agrupando en Python, ver
+`admin_panel()`): el "último visto"/IP/SO que se muestran son los del
+job MÁS RECIENTE con ese nombre, no un estado en vivo. Como `jobs` ya
+guarda todo lo necesario, alcanza con consultarla — no hace falta una
+tabla nueva ni un ciclo de registro/heartbeat para los clientes.
 
 ### Dato que NO vive en la base: `agent/agent_config.json`
 

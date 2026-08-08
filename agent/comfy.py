@@ -64,12 +64,20 @@ def available() -> bool:
     """
     True si este nodo puede generar imagenes: necesita que exista el
     archivo de workflow Y que ComfyUI este corriendo y responda. Se usa
-    en agent.py para decidir si anunciar el backend "comfyui" como activo.
+    en agent.py para decidir si anunciar el backend "comfyui" como activo
+    -- se llama en CADA heartbeat (cada ~2s), asi que el timeout se
+    mantiene corto a proposito: en un nodo sin ComfyUI corriendo, conectar
+    a un puerto local sin nada escuchando tarda ~2s en fallar en Windows
+    con un timeout de 5s (se agota antes por otro motivo del lado del OS,
+    no por el timeout en si), lo que duplicaba el intervalo real del
+    heartbeat. Con 1s alcanza de sobra para una llamada local cuando
+    ComfyUI SI esta corriendo (responde en milisegundos, medido en la
+    practica en <10ms via loopback).
     """
     if not WORKFLOW.exists():
         return False
     try:
-        requests.get(f"{COMFY}/system_stats", timeout=5).raise_for_status()
+        requests.get(f"{COMFY}/system_stats", timeout=0.5).raise_for_status()
         return True
     except requests.RequestException:
         return False

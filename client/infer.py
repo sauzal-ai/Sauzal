@@ -10,11 +10,14 @@ registra nada, no tiene credenciales, solo habla con el servidor
 Flujo:
   1. POST /infer al servidor, con el modelo, el prompt, y opcionalmente
      el nodo destino. Tambien se manda un identificador de "quien pide"
-     (--client, por defecto el hostname de esta PC) que el servidor
-     guarda junto con el job -- es un dato informativo, no una identidad
-     autenticada (cualquiera puede mandar el --client que quiera). El
-     servidor elige (o valida) que nodo remoto va a procesar el pedido y
-     devuelve un job_id.
+     (--client, por defecto el hostname de esta PC) mas el sistema
+     operativo y procesador de esta maquina (via el modulo `platform`) --
+     son datos informativos, no una identidad autenticada (cualquiera
+     puede correr este script con datos falsos). La IP real y si el
+     pedido vino de un navegador o de un script, en cambio, los calcula
+     el SERVIDOR solo (de la conexion HTTP y el header User-Agent), sin
+     que este script tenga que declarar nada. El servidor elige (o
+     valida) que nodo remoto va a procesar el pedido y devuelve un job_id.
   2. Polling a GET /jobs/{job_id} cada 1 segundo hasta que el status sea
      "completed" (se imprime la respuesta y las metricas) o "failed" (se
      lanza una excepcion con el mensaje de error del agente remoto).
@@ -32,7 +35,7 @@ el resto del repo Sauzal para funcionar, por eso es facil de copiar a
 cualquier PC que solo quiera consumir la red, sin ser un nodo.
 """
 
-import argparse, json, socket, time, requests
+import argparse, json, platform, socket, time, requests
 
 p=argparse.ArgumentParser()
 p.add_argument("--server",required=True,help="URL del control plane, ej: http://192.168.1.78:8000")
@@ -43,10 +46,19 @@ p.add_argument("--client",default=socket.gethostname(),help="Identificador de qu
 args=p.parse_args()
 server=args.server.rstrip("/")
 
+# SO y procesador de esta PC, para que el panel /admin del servidor los
+# pueda mostrar en el detalle del cliente. Igual que --client, son datos
+# que este script declara por su cuenta, no verificados por el servidor.
+client_os=f"{platform.system()} {platform.release()}".strip()
+client_processor=platform.processor() or platform.machine() or None
+
 # 1. Pedimos el trabajo. El servidor responde apenas lo encola, sin
 #    esperar a que termine (por eso hace falta el polling de abajo).
 r=requests.post(f"{server}/infer",
-    json={"model":args.model,"prompt":args.prompt,"node":args.node,"client":args.client},timeout=20)
+    json={
+        "model":args.model,"prompt":args.prompt,"node":args.node,"client":args.client,
+        "client_os":client_os,"client_processor":client_processor,
+    },timeout=20)
 r.raise_for_status()
 job=r.json()
 print("Job:",job["job_id"])

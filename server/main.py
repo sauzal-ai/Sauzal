@@ -68,11 +68,12 @@ Limitaciones conocidas (ver README, seccion "No usar en produccion")
 """
 
 from __future__ import annotations
-import html, json, sqlite3, time, uuid
+import html, ipaddress, json, os, sqlite3, time, urllib.parse, uuid
 from contextlib import contextmanager
 from pathlib import Path
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse, RedirectResponse
+import requests
+from fastapi import FastAPI, Form, HTTPException, Request
+from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from pydantic import BaseModel, Field
 
 # Base de datos SQLite, vive al lado de este archivo (server/sauzal.db).
@@ -100,6 +101,79 @@ def db():
         conn.close()
 
 
+def client_ip(request: Request) -> str:
+    """
+    IP real de quien hizo la request, con un cuidado especial: si el
+    servidor esta detras de un tunel/proxy (como el Cloudflare Tunnel que
+    se uso para exponer este servidor a los Pods de RunPod), la conexion
+    TCP que ve FastAPI es siempre la del proceso del tunel en localhost
+    (127.0.0.1), no la del nodo/cliente real. Cloudflare agrega el header
+    `CF-Connecting-IP` con la IP original; otros proxies suelen usar
+    `X-Forwarded-For`. Se prueban esos headers primero y se cae a la IP
+    de conexion directa si no estan presentes.
+
+    Importante: estos headers los puede mandar CUALQUIERA si se le pega
+    directo al servidor sin pasar por un proxy de confianza (no hay nada
+    validando que vengan realmente de Cloudflare) -- es el mismo criterio
+    de confianza que el resto de este servidor (sin autenticacion en
+    /infer, nombres de nodo auto-declarados, etc.), no un dato a prueba
+    de falsificacion.
+    """
+    cf_ip = request.headers.get("cf-connecting-ip")
+    if cf_ip:
+        return cf_ip.strip()
+    fwd = request.headers.get("x-forwarded-for")
+    if fwd:
+        return fwd.split(",")[0].strip()
+    return request.client.host if request.client else "desconocida"
+
+
+# Cache en memoria de IP -> "Ciudad, Pais" (o None si no se pudo resolver),
+# para no golpear la API externa de geolocalizacion en cada heartbeat con
+# la misma IP repetida. Se pierde si se reinicia el servidor -- no hace
+# falta persistirla, es barato volver a calcularla.
+_GEO_CACHE: dict[str, str | None] = {}
+
+def geolocate(ip: str) -> str | None:
+    """
+    Resuelve una IP a "Ciudad, Pais" usando ip-api.com (servicio gratuito,
+    sin necesidad de API key). Devuelve None para:
+      - IPs privadas/de loopback (192.168.x.x, 10.x.x.x, 127.0.0.1, etc.):
+        no tiene sentido geolocalizar una IP de LAN, y evita gastar
+        cuota del servicio externo en vano.
+      - Cualquier error de red o respuesta invalida del servicio.
+
+    Los resultados se cachean en memoria por IP (`_GEO_CACHE`): la
+    primera vez que se ve una IP nueva se hace la consulta real, las
+    siguientes veces se devuelve el valor ya guardado.
+    """
+    if ip in _GEO_CACHE:
+        return _GEO_CACHE[ip]
+    try:
+        if ipaddress.ip_address(ip).is_private:
+            _GEO_CACHE[ip] = None
+            return None
+    except ValueError:
+        _GEO_CACHE[ip] = None
+        return None
+    try:
+        r = requests.get(
+            f"http://ip-api.com/json/{ip}",
+            params={"fields": "status,country,regionName,city"},
+            timeout=5,
+        )
+        data = r.json()
+        if data.get("status") == "success":
+            parts = [p for p in (data.get("city"), data.get("country")) if p]
+            location = ", ".join(parts) or None
+        else:
+            location = None
+    except Exception:
+        location = None
+    _GEO_CACHE[ip] = location
+    return location
+
+
 @app.on_event("startup")
 def startup():
     """
@@ -113,28 +187,73 @@ def startup():
         token         -- credencial secreta del nodo (par con node_id)
         status        -- "available" | "busy" (lo actualiza el propio nodo)
         last_seen     -- timestamp (epoch) del ultimo heartbeat
-        capabilities  -- JSON en texto: que backends/modelos tiene el nodo
+        capabilities  -- JSON en texto: hardware/software del nodo (VRAM, RAM,
+                         driver, motor de computo, modelos, versiones,
+                         benchmark, temperatura, consumo -- ver
+                         agent.py::capabilities() para el detalle completo
+                         de que trae cada campo y como se mide)
+        paused        -- 0/1. Disponibilidad: si esta en 1, /infer nunca le
+                         asigna trabajos aunque este online. Se puede fijar
+                         como preferencia por defecto desde el agente
+                         (--paused al registrarse) y despues sobreescribir
+                         en cualquier momento desde /admin (el heartbeat NO
+                         toca esta columna, para que la decision del panel
+                         persista aunque el agente se reconecte)
+        price_kwh     -- precio de la electricidad para ESTE nodo (moneda
+                         libre, la que use el operador), cargado a mano en
+                         /admin. NULL si no se configuro -- en ese caso no
+                         se puede estimar el costo, solo el consumo en W
+        energy_wh     -- energia acumulada estimada, en Watt-hora. El
+                         agente manda un incremento en cada heartbeat
+                         (consumo instantaneo x tiempo transcurrido desde
+                         el heartbeat anterior) y el servidor lo va sumando.
+                         Es una ESTIMACION (no un medidor real), y solo se
+                         acumula mientras el agente esta corriendo y
+                         reportando un consumo valido (GPUs no-NVIDIA no
+                         reportan consumo, ver limitaciones)
+        latency_ms    -- tiempo de ida y vuelta (ms) del ultimo heartbeat,
+                         medido por el propio agente. Sirve como proxy de
+                         "que tan lejos" esta ese nodo del servidor
+        ip_address    -- IP real del nodo (ver client_ip()), actualizada
+                         en cada register/heartbeat
+        location      -- "Ciudad, Pais" resuelto de ip_address via
+                         geolocate() (ver esa funcion), o NULL si la IP
+                         es privada/LAN o no se pudo resolver
 
     Tabla `jobs`: un registro por cada pedido de inferencia.
-        job_id         -- UUID (PK)
-        model          -- nombre del modelo pedido (ej: "gemma3:4b", "flux...")
-        prompt         -- el prompt de texto o imagen
-        status         -- "queued" -> "running" -> "completed" | "failed"
-        assigned_node  -- a que nodo se le asigno el trabajo
-        client         -- quien lo pidio (dato libre que manda el cliente,
-                          ej: su hostname; NO es una identidad autenticada,
-                          ver limitaciones mas abajo)
-        result         -- JSON en texto con la respuesta (si completed)
-        error          -- texto del error (si failed)
-        prompt_tokens  -- tokens de entrada consumidos (solo jobs de texto;
-                          NULL en jobs de imagen, que no tienen ese concepto)
-        output_tokens  -- tokens de salida generados (idem)
+        job_id             -- UUID (PK)
+        model              -- nombre del modelo pedido (ej: "gemma3:4b", "flux...")
+        prompt             -- el prompt de texto o imagen
+        status             -- "queued" -> "running" -> "completed" | "failed"
+        assigned_node      -- a que nodo se le asigno el trabajo
+        client             -- quien lo pidio (dato libre que manda el cliente,
+                              ej: su hostname; NO es una identidad autenticada,
+                              ver limitaciones mas abajo)
+        client_ip          -- IP real de quien mando el pedido (ver client_ip())
+        client_location    -- "Ciudad, Pais" resuelta de client_ip, o NULL
+        client_user_agent  -- header User-Agent de la request a /infer. Revela
+                              si vino de un navegador (contiene "Mozilla/...")
+                              o de un script (ej: "python-requests/2.32.4")
+                              SIN que el cliente tenga que declarar nada
+        client_os          -- sistema operativo del cliente (dato libre que
+                              manda client/infer.py, ej: "Windows 10")
+        client_processor   -- procesador/arquitectura del cliente (idem)
+        result             -- JSON en texto con la respuesta (si completed)
+        error              -- texto del error (si failed)
+        prompt_tokens      -- tokens de entrada consumidos (solo jobs de texto;
+                              NULL en jobs de imagen, que no tienen ese concepto)
+        output_tokens      -- tokens de salida generados (idem)
+        duration_ms        -- cuanto tardo la ejecucion real, en milisegundos.
+                              Lo mide el AGENTE (cronometrando execute(job) de
+                              punta a punta) y lo manda tanto si el job salio
+                              bien como si fallo -- asi que tambien sirve para
+                              ver cuanto tardo en fallar/timeoutear un job
         created_at / updated_at -- timestamps (epoch)
 
     Migracion liviana: si `sauzal.db` ya existia de una version anterior
-    de este archivo (sin las columnas client/prompt_tokens/output_tokens),
-    se le agregan con ALTER TABLE la primera vez que arranca el servidor
-    con este codigo. No hace falta borrar la base a mano.
+    de este archivo (sin alguna de las columnas nuevas), se le agregan con
+    ALTER TABLE la primera vez que arranca el servidor con este codigo. No
+    hace falta borrar la base a mano.
     """
     with db() as conn:
         conn.executescript("""
@@ -146,14 +265,32 @@ def startup():
           assigned_node TEXT, result TEXT, error TEXT,
           created_at REAL, updated_at REAL);
         """)
-        existing_cols = {r["name"] for r in conn.execute("PRAGMA table_info(jobs)").fetchall()}
+        existing_job_cols = {r["name"] for r in conn.execute("PRAGMA table_info(jobs)").fetchall()}
         for column, coltype in (
             ("client", "TEXT"),
             ("prompt_tokens", "INTEGER"),
             ("output_tokens", "INTEGER"),
+            ("client_ip", "TEXT"),
+            ("client_location", "TEXT"),
+            ("client_user_agent", "TEXT"),
+            ("client_os", "TEXT"),
+            ("client_processor", "TEXT"),
+            ("duration_ms", "REAL"),
         ):
-            if column not in existing_cols:
+            if column not in existing_job_cols:
                 conn.execute(f"ALTER TABLE jobs ADD COLUMN {column} {coltype}")
+
+        existing_node_cols = {r["name"] for r in conn.execute("PRAGMA table_info(nodes)").fetchall()}
+        for column, coltype in (
+            ("paused", "INTEGER DEFAULT 0"),
+            ("price_kwh", "REAL"),
+            ("energy_wh", "REAL DEFAULT 0"),
+            ("latency_ms", "REAL"),
+            ("ip_address", "TEXT"),
+            ("location", "TEXT"),
+        ):
+            if column not in existing_node_cols:
+                conn.execute(f"ALTER TABLE nodes ADD COLUMN {column} {coltype}")
 
 
 # ----------------------------------------------------------------------
@@ -164,6 +301,7 @@ class Register(BaseModel):
     """Body de POST /nodes/register: como se presenta un agente nuevo."""
     name: str            # nombre legible elegido por el agente (--name)
     capabilities: str    # JSON en texto con lo que el nodo puede hacer
+    paused: bool = False # preferencia de disponibilidad por defecto (--paused del agente)
 
 class Auth(BaseModel):
     """
@@ -178,6 +316,8 @@ class Heartbeat(Auth):
     """Body de POST /nodes/heartbeat: 'sigo vivo' + estado actual."""
     status: str = "available"
     capabilities: str | None = None  # si viene, actualiza las capacidades guardadas
+    latency_ms: float | None = None  # ida y vuelta del heartbeat anterior, medido por el agente
+    energy_wh_delta: float | None = None  # energia consumida (Wh) desde el heartbeat anterior, a sumar al acumulado
 
 class Infer(BaseModel):
     """Body de POST /infer: lo que pide un cliente."""
@@ -185,6 +325,8 @@ class Infer(BaseModel):
     prompt: str = Field(min_length=1)
     node: str | None = None       # opcional: forzar un nodo puntual (nombre o node_id)
     client: str | None = None     # quien lo pide (dato libre, ej: hostname del cliente; no autenticado)
+    client_os: str | None = None          # SO del cliente (dato libre, self-reportado)
+    client_processor: str | None = None   # procesador/arquitectura del cliente (idem)
 
 class Result(Auth):
     """Body de POST /jobs/{job_id}/result: lo que devuelve el agente al terminar."""
@@ -193,6 +335,7 @@ class Result(Auth):
     error: str | None = None    # texto del error, si success=False
     prompt_tokens: int | None = None   # tokens de entrada, si el backend los reporta (Ollama si, ComfyUI no)
     output_tokens: int | None = None   # tokens de salida, idem
+    duration_ms: float | None = None   # tiempo real de ejecucion, medido por el agente (exito o fallo)
 
 
 def authenticate(conn, node_id, token):
@@ -221,45 +364,92 @@ def health():
     return {"status":"ok","service":"sauzal-control-plane","version":"0.2.0"}
 
 
+# Bloque fijo de 2MB, generado una sola vez al importar el modulo (no en
+# cada request). Datos aleatorios (no ceros) para que no lo comprima de
+# arriba ningun proxy/middleware y la medicion de velocidad sea honesta.
+_BENCH_PAYLOAD = os.urandom(2 * 1024 * 1024)
+
+@app.get("/bench/payload")
+def bench_payload():
+    """
+    Devuelve ese bloque de 2MB sin ningun otro proposito que servir de
+    "peso conocido": el agente lo descarga una vez al registrarse y
+    calcula su velocidad de red cronometrando la descarga (bytes / tiempo).
+    Se mide contra ESTE servidor a proposito -- lo relevante para la red
+    Sauzal es que tan rapido le llega el trabajo/resultado al control
+    plane, no un benchmark generico de banda ancha contra un tercero.
+    """
+    return Response(content=_BENCH_PAYLOAD, media_type="application/octet-stream")
+
+
 @app.post("/nodes/register")
-def register(req: Register):
+def register(req: Register, request: Request):
     """
     Da de alta un nodo nuevo. Genera un node_id y un token aleatorios
     (UUID4) y los guarda junto con el nombre y las capacidades declaradas.
     El agente llama esto una sola vez (o cuando borra su agent_config.json)
     y persiste la respuesta para no tener que registrarse de nuevo en cada
     arranque.
+
+    `paused` es la preferencia de disponibilidad que declara el AGENTE al
+    registrarse (flag --paused). Es solo un valor inicial: una vez creado
+    el nodo, el panel /admin puede pausarlo/reactivarlo en cualquier
+    momento sin que los heartbeats posteriores lo pisen (ver heartbeat()).
+    `price_kwh`, `energy_wh` y `latency_ms` quedan en sus valores por
+    defecto (NULL, 0, NULL) hasta que se configuren/midan despues.
+
+    `ip_address`/`location` se calculan aca mismo, del lado del servidor
+    (ver `client_ip()` y `geolocate()`) -- el agente no manda ni puede
+    falsificar estos dos campos.
     """
     node_id, token = str(uuid.uuid4()), str(uuid.uuid4())
+    ip = client_ip(request)
+    location = geolocate(ip)
     with db() as conn:
         conn.execute(
-            "INSERT INTO nodes VALUES(?,?,?,?,?,?)",
-            (node_id, req.name, token, "available", time.time(), req.capabilities)
+            "INSERT INTO nodes(node_id,name,token,status,last_seen,capabilities,paused,ip_address,location) VALUES(?,?,?,?,?,?,?,?,?)",
+            (node_id, req.name, token, "available", time.time(), req.capabilities, int(req.paused), ip, location)
         )
     return {"node_id":node_id,"token":token}
 
 
 @app.post("/nodes/heartbeat")
-def heartbeat(req: Heartbeat):
+def heartbeat(req: Heartbeat, request: Request):
     """
     El agente llama esto en bucle (cada ~2s) para:
       1. Probar que sigue autenticado (si el token no matchea, 401).
       2. Actualizar last_seen (asi /nodes lo sigue mostrando "online").
       3. Opcionalmente refrescar sus capabilities (por si cambiaron los
          modelos disponibles en Ollama/ComfyUI desde el ultimo heartbeat).
+      4. Opcionalmente reportar latencia (ida y vuelta del heartbeat
+         anterior) y un incremento de energia consumida (Wh), que se van
+         acumulando en `energy_wh`.
+      5. Refrescar ip_address/location (por si el nodo cambio de red; en
+         la practica `geolocate()` esta cacheada por IP asi que esto no
+         implica golpear la API externa en cada heartbeat).
+
+    El UPDATE se arma dinamicamente para no pisar con NULL los campos que
+    el agente no mando en esta llamada puntual. A proposito NUNCA se toca
+    `paused` aca: esa columna solo la cambian el registro inicial del
+    agente o una accion manual en /admin, para que la pausa "pegue" sin
+    importar cuantos heartbeats lleguen despues.
     """
     with db() as conn:
         authenticate(conn, req.node_id, req.token)
-        if req.capabilities is None:
-            conn.execute(
-                "UPDATE nodes SET status=?,last_seen=? WHERE node_id=?",
-                (req.status,time.time(),req.node_id)
-            )
-        else:
-            conn.execute(
-                "UPDATE nodes SET status=?,last_seen=?,capabilities=? WHERE node_id=?",
-                (req.status,time.time(),req.capabilities,req.node_id)
-            )
+        ip = client_ip(request)
+        sets = ["status=?", "last_seen=?", "ip_address=?", "location=?"]
+        params = [req.status, time.time(), ip, geolocate(ip)]
+        if req.capabilities is not None:
+            sets.append("capabilities=?")
+            params.append(req.capabilities)
+        if req.latency_ms is not None:
+            sets.append("latency_ms=?")
+            params.append(req.latency_ms)
+        if req.energy_wh_delta is not None:
+            sets.append("energy_wh=COALESCE(energy_wh,0)+?")
+            params.append(req.energy_wh_delta)
+        params.append(req.node_id)
+        conn.execute(f"UPDATE nodes SET {','.join(sets)} WHERE node_id=?", params)
     return {"ok":True}
 
 
@@ -277,24 +467,39 @@ def list_nodes():
     now=time.time()
     with db() as conn:
         rows=conn.execute(
-            "SELECT node_id,name,status,last_seen,capabilities FROM nodes ORDER BY last_seen DESC"
+            "SELECT node_id,name,status,last_seen,capabilities,ip_address,location FROM nodes ORDER BY last_seen DESC"
         ).fetchall()
     return [{**dict(r),"online":now-r["last_seen"]<30} for r in rows]
 
 
 @app.post("/infer")
-def infer(req: Infer):
+def infer(req: Infer, request: Request):
     """
     Punto de entrada para pedir una inferencia. No requiere autenticacion
     (ver limitacion en el docstring del modulo).
 
+    Datos del cliente que se guardan junto con el job (ver tabla `jobs`
+    en el docstring de startup() para el detalle de cada columna):
+      - `client_ip`/`client_location`: calculados por el SERVIDOR (no los
+        puede falsificar el cliente, salvo spoofeando su propia IP de
+        origen o los headers de proxy que confia client_ip()).
+      - `client_user_agent`: header User-Agent tal cual lo manda el
+        cliente HTTP -- revela sin que nadie lo declare si vino de un
+        navegador o de un script (ej: "python-requests/2.32.4").
+      - `client_os`/`client_processor`: SI son self-reportados por el
+        cliente (`client/infer.py` los arma con el modulo `platform`) --
+        no autenticados, igual criterio que el campo `client`.
+
     Eleccion de nodo:
+      - Se excluyen siempre los nodos con `paused=1` (pausados desde el
+        agente al registrarse, o manualmente desde /admin), aunque esten
+        online y con status='available'.
       - Si el cliente mando `node` (nombre o node_id), se busca ESE nodo
-        puntual, y debe estar disponible y con heartbeat reciente (<30s),
-        sino 503.
-      - Si no mando `node`, se toma el nodo disponible visto mas
-        recientemente (heuristica simple, no es un balanceador real: no
-        pesa carga ni afinidad de modelo/GPU).
+        puntual, y debe estar disponible, no pausado, y con heartbeat
+        reciente (<30s), sino 503.
+      - Si no mando `node`, se toma el nodo disponible (no pausado) visto
+        mas recientemente (heuristica simple, no es un balanceador real:
+        no pesa carga ni afinidad de modelo/GPU).
 
     Al asignar el trabajo:
       1. Se inserta la fila en `jobs` con status="queued".
@@ -311,22 +516,31 @@ def infer(req: Infer):
         if req.node:
             node=conn.execute("""
               SELECT node_id FROM nodes
-              WHERE status='available' AND last_seen>? AND (node_id=? OR name=?)
+              WHERE status='available' AND last_seen>? AND COALESCE(paused,0)=0
+                AND (node_id=? OR name=?)
               ORDER BY last_seen DESC LIMIT 1
             """,(now-30,req.node,req.node)).fetchone()
         else:
             node=conn.execute("""
               SELECT node_id FROM nodes
-              WHERE status='available' AND last_seen>?
+              WHERE status='available' AND last_seen>? AND COALESCE(paused,0)=0
               ORDER BY last_seen DESC LIMIT 1
             """,(now-30,)).fetchone()
         if not node:
             raise HTTPException(503,"No available Sauzal nodes")
         job_id=str(uuid.uuid4())
+        ip = client_ip(request)
         conn.execute("""
-          INSERT INTO jobs(job_id,model,prompt,status,assigned_node,client,created_at,updated_at)
-          VALUES(?,?,?,'queued',?,?,?,?)
-        """,(job_id,req.model,req.prompt,node["node_id"],req.client,now,now))
+          INSERT INTO jobs(
+            job_id,model,prompt,status,assigned_node,client,
+            client_ip,client_location,client_user_agent,client_os,client_processor,
+            created_at,updated_at
+          ) VALUES(?,?,?,'queued',?,?,?,?,?,?,?,?,?)
+        """,(
+            job_id,req.model,req.prompt,node["node_id"],req.client,
+            ip,geolocate(ip),request.headers.get("user-agent"),req.client_os,req.client_processor,
+            now,now
+        ))
         conn.execute("UPDATE nodes SET status='busy' WHERE node_id=?",(node["node_id"],))
     return {"job_id":job_id,"assigned_node":node["node_id"],"status":"queued"}
 
@@ -373,8 +587,8 @@ def result(job_id: str, req: Result):
         authenticate(conn, req.node_id, req.token)
         status="completed" if req.success else "failed"
         conn.execute("""
-          UPDATE jobs SET status=?,result=?,error=?,prompt_tokens=?,output_tokens=?,updated_at=? WHERE job_id=?
-        """,(status,req.result,req.error,req.prompt_tokens,req.output_tokens,time.time(),job_id))
+          UPDATE jobs SET status=?,result=?,error=?,prompt_tokens=?,output_tokens=?,duration_ms=?,updated_at=? WHERE job_id=?
+        """,(status,req.result,req.error,req.prompt_tokens,req.output_tokens,req.duration_ms,time.time(),job_id))
         conn.execute(
             "UPDATE nodes SET status='available',last_seen=? WHERE node_id=?",
             (time.time(),req.node_id)
@@ -439,20 +653,48 @@ def _ago(ts: float, now: float) -> str:
     return f"{int(delta/86400)}d"
 
 
+def _fmt(value, suffix: str = "") -> str:
+    """Formatea un valor que puede ser None (dato no disponible en este
+    nodo, ej: temperatura en una GPU no-NVIDIA) como "N/A" en vez de
+    mostrar "None" crudo en el panel."""
+    return "N/A" if value is None else f"{value}{suffix}"
+
+
+def _client_origin(user_agent: str | None) -> str:
+    """
+    Heuristica simple para distinguir si un pedido a /infer vino de un
+    navegador o de un script/API, a partir del header User-Agent (que
+    cualquier cliente HTTP manda automaticamente, sin que nadie lo
+    declare a mano). Los navegadores incluyen "Mozilla/5.0" en su User-
+    Agent por convencion historica; `requests` (lo que usa client/infer.py)
+    manda algo como "python-requests/2.32.4", `curl` manda "curl/8.x", etc.
+    No es infalible (un script puede mandar un User-Agent de navegador a
+    proposito), es solo una senal informativa mas.
+    """
+    if not user_agent:
+        return "desconocido"
+    ua = user_agent.lower()
+    if any(x in ua for x in ("mozilla", "chrome", "safari", "firefox", "edge/", "webkit")):
+        return "🌐 navegador"
+    return "🖥️ script/API"
+
+
 def _node_row(row: dict, now: float) -> str:
     """
-    Arma la fila <tr> de un nodo para la tabla del panel. Parsea el JSON
-    de `capabilities` para mostrar backends y GPU en columnas legibles
-    (si el JSON esta corrupto o vacio, se muestran vacios en vez de
-    romper toda la pagina).
+    Arma la fila <tr> compacta de un nodo para la tabla principal del
+    panel (nombre, estado, disponibilidad, backends). Todas las metricas
+    extendidas (VRAM, RAM, driver, benchmark, temperatura, consumo,
+    energia/costo, historial de fallas) viven en la pagina de detalle
+    (`/admin/nodes/{id}`, ver admin_node_detail) para no volver ilegible
+    esta tabla con 15 columnas.
 
-    Todo texto que viene de datos guardados por agentes/clientes (nombre,
-    GPU) pasa por `html.escape` antes de insertarse en el HTML, porque
-    esos valores no son de confianza (el nombre de un nodo, por ejemplo,
-    lo elige quien arranca el agente con --name, y /infer no tiene
-    autenticacion) -- sin este escape, alguien podria registrar un nodo
-    con un nombre tipo "<script>...</script>" y ejecutar JavaScript en el
-    navegador de quien abra este panel.
+    Todo texto que viene de datos guardados por agentes/clientes (nombre)
+    pasa por `html.escape` antes de insertarse en el HTML, porque esos
+    valores no son de confianza (el nombre de un nodo lo elige quien
+    arranca el agente con --name, y /infer no tiene autenticacion) -- sin
+    este escape, alguien podria registrar un nodo con un nombre tipo
+    "<script>...</script>" y ejecutar JavaScript en el navegador de quien
+    abra este panel.
     """
     try:
         caps = json.loads(row["capabilities"] or "{}")
@@ -461,18 +703,27 @@ def _node_row(row: dict, now: float) -> str:
     online = now - row["last_seen"] < 30
     services = caps.get("services", {}) if isinstance(caps, dict) else {}
     backends = ", ".join(k for k, v in services.items() if v) or "-"
-    gpu = ", ".join(caps.get("gpu", [])) if isinstance(caps, dict) else ""
     badge = "🟢 online" if online else "⚪ offline"
     name = html.escape(row["name"] or "")
+    paused = bool(row.get("paused"))
+    disponibilidad = "⏸️ Pausado" if paused else "✅ Activo"
+    pause_action, pause_label = ("resume", "Reactivar") if paused else ("pause", "Pausar")
+    ip_label = html.escape(row.get("ip_address") or "N/A")
+    location = row.get("location")
+    ip_display = f"{ip_label} ({html.escape(location)})" if location else ip_label
     return f"""
     <tr>
-      <td>{name}</td>
+      <td><a href="/admin/nodes/{row['node_id']}">{name}</a></td>
       <td>{badge}</td>
+      <td>{disponibilidad}</td>
       <td>{html.escape(row["status"] or "")}</td>
+      <td>{ip_display}</td>
       <td>{_ago(row["last_seen"], now)}</td>
       <td>{html.escape(backends)}</td>
-      <td title="{html.escape(gpu)}">{html.escape(gpu[:40])}</td>
       <td class="actions">
+        <form method="post" action="/admin/nodes/{row['node_id']}/{pause_action}">
+          <button>{pause_label}</button>
+        </form>
         <form method="post" action="/admin/nodes/{row['node_id']}/unstick">
           <button title="Forzar status='available' (util si quedo colgado en busy)">Forzar disponible</button>
         </form>
@@ -495,7 +746,11 @@ def _job_row(row: dict, now: float) -> str:
     prompt = row["prompt"] or ""
     prompt_short = prompt if len(prompt) <= 60 else prompt[:57] + "..."
     node_label = row["node_name"] or row["assigned_node"] or "-"
-    client = html.escape(row.get("client") or "-")
+    client_name = row.get("client")
+    client = (
+        f'<a href="/admin/clients/{urllib.parse.quote(client_name)}">{html.escape(client_name)}</a>'
+        if client_name else "-"
+    )
     # Los tokens solo existen para jobs de texto (Ollama los reporta);
     # los de imagen (ComfyUI) quedan en NULL, se muestra "-" en ese caso.
     pt, ot = row.get("prompt_tokens"), row.get("output_tokens")
@@ -506,6 +761,12 @@ def _job_row(row: dict, now: float) -> str:
         "completed": "✅",
         "failed": "❌",
     }.get(row["status"], "")
+    # duration_ms lo mide el agente (exito o fallo); "-" mientras el job
+    # sigue queued/running y todavia no hay un resultado que reportar.
+    duration_ms = row.get("duration_ms")
+    duration = f"{duration_ms/1000:.1f}s" if duration_ms and duration_ms >= 1000 else (
+        f"{duration_ms:.0f}ms" if duration_ms is not None else "-"
+    )
     return f"""
     <tr>
       <td><a href="/jobs/{row['job_id']}" target="_blank">{row['job_id'][:8]}…</a></td>
@@ -515,6 +776,7 @@ def _job_row(row: dict, now: float) -> str:
       <td>{status_icon} {html.escape(row["status"] or "")}</td>
       <td>{html.escape(node_label)}</td>
       <td title="tokens de entrada/salida">{tokens}</td>
+      <td>{duration}</td>
       <td>{_ago(row["created_at"], now)}</td>
       <td class="actions">
         <form method="post" action="/admin/jobs/{row['job_id']}/delete" onsubmit="return confirm('¿Eliminar este trabajo?')">
@@ -524,13 +786,40 @@ def _job_row(row: dict, now: float) -> str:
     </tr>"""
 
 
+def _client_row(c: dict, now: float) -> str:
+    """
+    Arma la fila <tr> de un cliente para la tabla principal del panel.
+
+    A diferencia de los nodos, un "cliente" no se registra ni manda
+    heartbeat: esta fila se arma agregando la tabla `jobs` por el campo
+    `client` (ver admin_panel()). Los datos de IP/ubicacion/SO/user-agent
+    que se muestran son los del job MAS RECIENTE de ese nombre de
+    cliente -- una "foto" del ultimo pedido, no un estado "en vivo" como
+    el online/offline de los nodos.
+    """
+    name = c["client"]
+    ip = html.escape(c.get("client_ip") or "N/A")
+    location = c.get("client_location")
+    ip_display = f"{ip} ({html.escape(location)})" if location else ip
+    return f"""
+    <tr>
+      <td><a href="/admin/clients/{urllib.parse.quote(name)}">{html.escape(name)}</a></td>
+      <td>{ip_display}</td>
+      <td>{_client_origin(c.get("client_user_agent"))}</td>
+      <td>{html.escape(c.get("client_os") or "N/A")}</td>
+      <td>{c["job_count"]}</td>
+      <td>{_ago(c["created_at"], now)}</td>
+    </tr>"""
+
+
 @app.get("/admin", response_class=HTMLResponse)
 def admin_panel():
     """
-    Pagina principal del panel: trae TODOS los nodos y los ultimos 200
-    trabajos (mas nuevos primero) y arma una unica pagina HTML con dos
-    tablas. No pagina los nodos (en la practica nunca son tantos como
-    para necesitarlo); los jobs si se limitan a 200 para que la tabla no
+    Pagina principal del panel: trae TODOS los nodos, todos los clientes
+    distintos (agregados de `jobs`), y los ultimos 200 trabajos (mas
+    nuevos primero), y arma una unica pagina HTML con tres tablas. No
+    pagina nodos/clientes (en la practica nunca son tantos como para
+    necesitarlo); los jobs si se limitan a 200 para que la tabla no
     crezca sin limite en una red con mucho trafico.
     """
     now = time.time()
@@ -543,11 +832,28 @@ def admin_panel():
           LEFT JOIN nodes ON nodes.node_id = jobs.assigned_node
           ORDER BY jobs.created_at DESC LIMIT 200
         """).fetchall()]
+        client_job_rows = [dict(r) for r in conn.execute("""
+          SELECT client, client_ip, client_location, client_os, client_processor,
+                 client_user_agent, created_at
+          FROM jobs WHERE client IS NOT NULL ORDER BY created_at DESC
+        """).fetchall()]
+
+    # Agrupa por nombre de cliente en Python (no en SQL) para quedarse con
+    # los datos del job MAS RECIENTE de cada uno (la lista ya viene
+    # ordenada DESC, asi que el primero que aparece es el mas nuevo) mas
+    # un conteo total de trabajos.
+    clients_by_name: dict[str, dict] = {}
+    for r in client_job_rows:
+        entry = clients_by_name.setdefault(r["client"], {**r, "job_count": 0})
+        entry["job_count"] += 1
+    clients = list(clients_by_name.values())
 
     nodes_html = "".join(_node_row(n, now) for n in nodes) or \
-        "<tr><td colspan='7'>No hay nodos registrados todavia.</td></tr>"
+        "<tr><td colspan='8'>No hay nodos registrados todavia.</td></tr>"
+    clients_html = "".join(_client_row(c, now) for c in clients) or \
+        "<tr><td colspan='6'>Todavia no hay pedidos de ningun cliente.</td></tr>"
     jobs_html = "".join(_job_row(j, now) for j in jobs) or \
-        "<tr><td colspan='9'>No hay trabajos todavia.</td></tr>"
+        "<tr><td colspan='10'>No hay trabajos todavia.</td></tr>"
     online_count = sum(1 for n in nodes if now - n["last_seen"] < 30)
 
     return HTMLResponse(f"""<!doctype html>
@@ -575,17 +881,280 @@ def admin_panel():
 </head>
 <body>
   <h1>Sauzal · Panel de administracion</h1>
-  <p class="summary">{len(nodes)} nodos registrados ({online_count} online) · {len(jobs)} trabajos mostrados (ultimos 200) · se actualiza sola cada 5s</p>
+  <p class="summary">{len(nodes)} nodos registrados ({online_count} online) · {len(clients)} clientes distintos · {len(jobs)} trabajos mostrados (ultimos 200) · se actualiza sola cada 5s · click en un nombre para ver mas detalle</p>
 
   <h2>Nodos</h2>
   <table>
-    <tr><th>Nombre</th><th>Online</th><th>Status</th><th>Ultimo heartbeat</th><th>Backends</th><th>GPU</th><th>Acciones</th></tr>
+    <tr><th>Nombre</th><th>Online</th><th>Disponibilidad</th><th>Status</th><th>IP (ubicacion)</th><th>Ultimo heartbeat</th><th>Backends</th><th>Acciones</th></tr>
     {nodes_html}
+  </table>
+
+  <h2>Clientes</h2>
+  <table>
+    <tr><th>Nombre</th><th>IP (ubicacion)</th><th>Origen</th><th>SO</th><th>Trabajos</th><th>Ultimo pedido hace</th></tr>
+    {clients_html}
   </table>
 
   <h2>Trabajos</h2>
   <table>
-    <tr><th>Job</th><th>Modelo</th><th>Prompt</th><th>Cliente</th><th>Estado</th><th>Nodo</th><th>Tokens (in/out)</th><th>Creado hace</th><th>Acciones</th></tr>
+    <tr><th>Job</th><th>Modelo</th><th>Prompt</th><th>Cliente</th><th>Estado</th><th>Nodo</th><th>Tokens (in/out)</th><th>Duracion</th><th>Creado hace</th><th>Acciones</th></tr>
+    {jobs_html}
+  </table>
+</body>
+</html>""")
+
+
+@app.get("/admin/nodes/{node_id}", response_class=HTMLResponse)
+def admin_node_detail(node_id: str):
+    """
+    Pagina de detalle de UN nodo puntual: todas las metricas extendidas
+    que no entran comodas en la tabla principal de /admin -- hardware
+    (VRAM, RAM, driver, motor de computo), versiones de software,
+    benchmark medido al registrarse, latencia/velocidad de red,
+    temperatura/consumo en vivo (si el nodo es NVIDIA), energia
+    acumulada + costo estimado (configurando un precio de $/kWh), el
+    toggle de disponibilidad, y el historial de trabajos fallidos de
+    este nodo puntual.
+
+    Todos los campos de hardware/software que un nodo no pueda reportar
+    (por ejemplo, temperatura en una GPU no-NVIDIA) se muestran como
+    "N/A" en vez de inventar un valor o romper la pagina (ver `_fmt`).
+    """
+    now = time.time()
+    with db() as conn:
+        node = conn.execute("SELECT * FROM nodes WHERE node_id=?", (node_id,)).fetchone()
+        if not node:
+            raise HTTPException(404, "Nodo no encontrado")
+        node = dict(node)
+        failed_jobs = [dict(r) for r in conn.execute("""
+          SELECT job_id, model, error, created_at FROM jobs
+          WHERE assigned_node=? AND status='failed'
+          ORDER BY created_at DESC LIMIT 20
+        """, (node_id,)).fetchall()]
+        fail_count = conn.execute(
+            "SELECT COUNT(*) AS n FROM jobs WHERE assigned_node=? AND status='failed'", (node_id,)
+        ).fetchone()["n"]
+        total_jobs = conn.execute(
+            "SELECT COUNT(*) AS n FROM jobs WHERE assigned_node=?", (node_id,)
+        ).fetchone()["n"]
+
+    try:
+        caps = json.loads(node["capabilities"] or "{}")
+        if not isinstance(caps, dict):
+            caps = {}
+    except json.JSONDecodeError:
+        caps = {}
+
+    online = now - node["last_seen"] < 30
+    paused = bool(node["paused"])
+    services = caps.get("services", {}) if isinstance(caps.get("services"), dict) else {}
+    backends = ", ".join(k for k, v in services.items() if v) or "-"
+
+    energy_wh = node["energy_wh"] or 0
+    price_kwh = node["price_kwh"]
+    cost = (energy_wh/1000)*price_kwh if price_kwh is not None else None
+
+    benchmark = caps.get("benchmark") if isinstance(caps.get("benchmark"), dict) else {}
+    benchmark_html = "".join(
+        f"<div><b>{html.escape(str(k))}:</b> {html.escape(str(v))}</div>"
+        for k, v in benchmark.items()
+    ) or "<div>Sin datos de benchmark.</div>"
+
+    failed_rows = "".join(f"""
+      <tr>
+        <td><a href="/jobs/{j['job_id']}" target="_blank">{j['job_id'][:8]}…</a></td>
+        <td>{html.escape(j['model'] or '')}</td>
+        <td title="{html.escape(j['error'] or '')}">{html.escape((j['error'] or '')[:80])}</td>
+        <td>{_ago(j['created_at'], now)}</td>
+      </tr>""" for j in failed_jobs) or "<tr><td colspan='4'>Sin fallas registradas.</td></tr>"
+
+    return HTMLResponse(f"""<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="refresh" content="10">
+<title>Sauzal · {html.escape(node["name"] or node_id)}</title>
+<style>
+  body {{ font-family: system-ui, sans-serif; background:#0f1115; color:#e6e6e6; margin:2rem; }}
+  h1 {{ font-size:1.4rem; margin-bottom:0.2rem; }}
+  h2 {{ font-size:1.1rem; margin-top:2rem; color:#9aa0a6; }}
+  table {{ width:100%; border-collapse: collapse; margin-top:0.5rem; }}
+  th, td {{ text-align:left; padding:0.5rem 0.7rem; border-bottom:1px solid #2a2d34; font-size:0.9rem; vertical-align:top; }}
+  th {{ color:#9aa0a6; font-weight:600; }}
+  a {{ color:#7fb0ff; }}
+  .summary {{ color:#9aa0a6; font-size:0.9rem; }}
+  .grid {{ display:grid; grid-template-columns: repeat(auto-fit, minmax(220px,1fr)); gap:1rem; margin-top:1rem; }}
+  .card {{ background:#171a20; border:1px solid #2a2d34; border-radius:8px; padding:1rem; }}
+  .card h3 {{ margin:0 0 0.6rem 0; font-size:0.78rem; color:#9aa0a6; text-transform:uppercase; letter-spacing:0.05em; }}
+  .card div {{ font-size:0.95rem; margin-bottom:0.25rem; }}
+  .card form {{ margin-top:0.6rem; display:flex; gap:0.4rem; }}
+  button {{ background:#2a2d34; color:#e6e6e6; border:1px solid #3a3d44; border-radius:4px; padding:0.3rem 0.6rem; cursor:pointer; font-size:0.8rem; }}
+  button:hover {{ background:#3a3d44; }}
+  button.danger:hover {{ background:#5c2020; border-color:#7a2a2a; }}
+  input[type=number] {{ background:#0f1115; color:#e6e6e6; border:1px solid #3a3d44; border-radius:4px; padding:0.3rem 0.5rem; width:110px; }}
+</style>
+</head>
+<body>
+  <p><a href="/admin">← Volver al panel</a></p>
+  <h1>{html.escape(node["name"] or "")} {"🟢" if online else "⚪"}</h1>
+  <p class="summary">node_id: {node_id} · {"⏸️ Pausado" if paused else "✅ Activo"} · visto hace {_ago(node["last_seen"], now)} · {total_jobs} trabajos totales, {fail_count} fallidos</p>
+
+  <div class="grid">
+    <div class="card">
+      <h3>Disponibilidad</h3>
+      <div>{"Pausado manualmente: no recibe trabajos nuevos." if paused else "Disponible: puede recibir trabajos."}</div>
+      <form method="post" action="/admin/nodes/{node_id}/{'resume' if paused else 'pause'}">
+        <button>{"Reactivar" if paused else "Pausar"}</button>
+      </form>
+    </div>
+
+    <div class="card">
+      <h3>Hardware</h3>
+      <div>GPU: {html.escape(", ".join(caps.get("gpu") or []) or "N/A")}</div>
+      <div>VRAM: {_fmt(caps.get("vram_used_mb"))} / {_fmt(caps.get("vram_total_mb"))} MB</div>
+      <div>RAM: {_fmt(caps.get("ram_used_mb"))} / {_fmt(caps.get("ram_total_mb"))} MB</div>
+      <div>Driver: {html.escape(str(caps.get("driver_version") or "N/A"))}</div>
+      <div>Motor de computo: {html.escape(str(caps.get("compute_backend") or "N/A"))}</div>
+    </div>
+
+    <div class="card">
+      <h3>Software</h3>
+      <div>SO: {html.escape(caps.get("os") or "N/A")}</div>
+      <div>Ollama: {html.escape(str(caps.get("ollama_version") or "N/A"))}</div>
+      <div>ComfyUI (Python): {html.escape(str(caps.get("comfy_python_version") or "N/A"))}</div>
+      <div>Motores activos: {html.escape(backends)}</div>
+      <div>Modelos texto: {html.escape(", ".join(caps.get("ollama_models") or []) or "-")}</div>
+      <div>Modelos imagen: {html.escape(", ".join(caps.get("image_models") or []) or "-")}</div>
+    </div>
+
+    <div class="card">
+      <h3>Benchmark (medido al registrarse)</h3>
+      {benchmark_html}
+    </div>
+
+    <div class="card">
+      <h3>Red</h3>
+      <div>IP: {html.escape(node.get("ip_address") or "N/A")}</div>
+      <div>Ubicacion: {html.escape(node.get("location") or "N/A (IP privada o sin resolver)")}</div>
+      <div>Latencia heartbeat: {_fmt(node["latency_ms"], " ms")}</div>
+      <div>Velocidad hacia el servidor: {_fmt(caps.get("network_mbps"), " Mbps")}</div>
+    </div>
+
+    <div class="card">
+      <h3>Temperatura / Consumo (en vivo)</h3>
+      <div>Temperatura: {_fmt(caps.get("gpu_temp_c"), " °C")}</div>
+      <div>Consumo: {_fmt(caps.get("gpu_power_w"), " W")}</div>
+      <div style="color:#9aa0a6; font-size:0.8rem; margin-top:0.4rem;">Solo disponible en GPUs NVIDIA (nvidia-smi).</div>
+    </div>
+
+    <div class="card">
+      <h3>Energia y costo electrico</h3>
+      <div>Energia acumulada: {round(energy_wh, 2)} Wh</div>
+      <div>Precio configurado: {_fmt(price_kwh, "/kWh")}</div>
+      <div>Costo estimado: {_fmt(round(cost, 4) if cost is not None else None)}</div>
+      <form method="post" action="/admin/nodes/{node_id}/price">
+        <input type="number" step="0.0001" name="price_kwh" placeholder="precio $/kWh"
+          value="{price_kwh if price_kwh is not None else ''}">
+        <button>Guardar precio</button>
+      </form>
+      <form method="post" action="/admin/nodes/{node_id}/reset-energy" onsubmit="return confirm('¿Reiniciar el contador de energia a 0?')">
+        <button class="danger">Reiniciar contador</button>
+      </form>
+    </div>
+  </div>
+
+  <h2>Historial de fallas (ultimas 20)</h2>
+  <table>
+    <tr><th>Job</th><th>Modelo</th><th>Error</th><th>Hace</th></tr>
+    {failed_rows}
+  </table>
+</body>
+</html>""")
+
+
+@app.get("/admin/clients/{client_name}", response_class=HTMLResponse)
+def admin_client_detail(client_name: str):
+    """
+    Pagina de detalle de UN cliente puntual: IP, ubicacion, sistema
+    operativo, procesador, y si el origen parece un navegador o un
+    script -- todo tomado del job MAS RECIENTE de ese cliente -- mas su
+    historial completo de trabajos.
+
+    A diferencia de los nodos, los clientes NO se registran ni mandan
+    heartbeat: no existe una tabla `clients` separada. Esta pagina entera
+    se arma agregando la tabla `jobs` por el campo `client` (ver tambien
+    `admin_panel()`, que arma la tabla resumen con el mismo criterio).
+    Por eso un 404 aca significa "ese nombre nunca aparecio como client
+    en ningun job", no "no existe tal registro".
+    """
+    now = time.time()
+    with db() as conn:
+        total = conn.execute(
+            "SELECT COUNT(*) AS n FROM jobs WHERE client=?", (client_name,)
+        ).fetchone()["n"]
+        if total == 0:
+            raise HTTPException(404, "Cliente no encontrado (sin trabajos registrados)")
+        latest = dict(conn.execute(
+            "SELECT * FROM jobs WHERE client=? ORDER BY created_at DESC LIMIT 1", (client_name,)
+        ).fetchone())
+        jobs = [dict(r) for r in conn.execute("""
+          SELECT jobs.*, nodes.name AS node_name FROM jobs
+          LEFT JOIN nodes ON nodes.node_id = jobs.assigned_node
+          WHERE jobs.client=? ORDER BY jobs.created_at DESC LIMIT 100
+        """, (client_name,)).fetchall()]
+
+    jobs_html = "".join(_job_row(j, now) for j in jobs) or \
+        "<tr><td colspan='10'>Sin trabajos.</td></tr>"
+    user_agent = latest.get("client_user_agent") or ""
+
+    return HTMLResponse(f"""<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="refresh" content="15">
+<title>Sauzal · {html.escape(client_name)}</title>
+<style>
+  body {{ font-family: system-ui, sans-serif; background:#0f1115; color:#e6e6e6; margin:2rem; }}
+  h1 {{ font-size:1.4rem; margin-bottom:0.2rem; }}
+  h2 {{ font-size:1.1rem; margin-top:2rem; color:#9aa0a6; }}
+  table {{ width:100%; border-collapse: collapse; margin-top:0.5rem; }}
+  th, td {{ text-align:left; padding:0.5rem 0.7rem; border-bottom:1px solid #2a2d34; font-size:0.9rem; vertical-align:top; }}
+  th {{ color:#9aa0a6; font-weight:600; }}
+  a {{ color:#7fb0ff; }}
+  .summary {{ color:#9aa0a6; font-size:0.9rem; }}
+  .grid {{ display:grid; grid-template-columns: repeat(auto-fit, minmax(220px,1fr)); gap:1rem; margin-top:1rem; }}
+  .card {{ background:#171a20; border:1px solid #2a2d34; border-radius:8px; padding:1rem; }}
+  .card h3 {{ margin:0 0 0.6rem 0; font-size:0.78rem; color:#9aa0a6; text-transform:uppercase; letter-spacing:0.05em; }}
+  .card div {{ font-size:0.95rem; margin-bottom:0.25rem; }}
+  .actions {{ display:flex; gap:0.4rem; white-space:nowrap; }}
+  .actions form {{ margin:0; }}
+  button {{ background:#2a2d34; color:#e6e6e6; border:1px solid #3a3d44; border-radius:4px; padding:0.3rem 0.6rem; cursor:pointer; font-size:0.8rem; }}
+  button.danger:hover {{ background:#5c2020; border-color:#7a2a2a; }}
+</style>
+</head>
+<body>
+  <p><a href="/admin">← Volver al panel</a></p>
+  <h1>{html.escape(client_name)}</h1>
+  <p class="summary">{total} trabajos totales (mostrando los ultimos 100) · ultimo pedido hace {_ago(latest["created_at"], now)}</p>
+
+  <div class="grid">
+    <div class="card">
+      <h3>Origen</h3>
+      <div>IP: {html.escape(latest.get("client_ip") or "N/A")}</div>
+      <div>Ubicacion: {html.escape(latest.get("client_location") or "N/A (IP privada o sin resolver)")}</div>
+      <div>Tipo: {_client_origin(user_agent)}</div>
+      <div title="{html.escape(user_agent)}">User-Agent: {html.escape(user_agent[:60] or "N/A")}</div>
+    </div>
+    <div class="card">
+      <h3>Sistema (self-reportado)</h3>
+      <div>SO: {html.escape(latest.get("client_os") or "N/A")}</div>
+      <div>Procesador: {html.escape(latest.get("client_processor") or "N/A")}</div>
+    </div>
+  </div>
+
+  <h2>Historial de trabajos (ultimos 100)</h2>
+  <table>
+    <tr><th>Job</th><th>Modelo</th><th>Prompt</th><th>Cliente</th><th>Estado</th><th>Nodo</th><th>Tokens (in/out)</th><th>Duracion</th><th>Creado hace</th><th>Acciones</th></tr>
     {jobs_html}
   </table>
 </body>
@@ -621,6 +1190,49 @@ def admin_unstick_node(node_id: str):
     with db() as conn:
         conn.execute("UPDATE nodes SET status='available' WHERE node_id=?", (node_id,))
     return RedirectResponse("/admin", status_code=303)
+
+
+@app.post("/admin/nodes/{node_id}/pause")
+def admin_pause_node(node_id: str):
+    """
+    Pausa manualmente un nodo desde el panel: /infer deja de asignarle
+    trabajos aunque siga online (ver el filtro `paused=0` en /infer). A
+    diferencia de `status='busy'`, esto NO se resetea con los heartbeats
+    normales -- se queda pausado hasta un admin_resume_node() explicito.
+    """
+    with db() as conn:
+        conn.execute("UPDATE nodes SET paused=1 WHERE node_id=?", (node_id,))
+    return RedirectResponse("/admin", status_code=303)
+
+
+@app.post("/admin/nodes/{node_id}/resume")
+def admin_resume_node(node_id: str):
+    """Reactiva un nodo pausado (ver admin_pause_node)."""
+    with db() as conn:
+        conn.execute("UPDATE nodes SET paused=0 WHERE node_id=?", (node_id,))
+    return RedirectResponse("/admin", status_code=303)
+
+
+@app.post("/admin/nodes/{node_id}/price")
+def admin_set_price(node_id: str, price_kwh: float = Form(...)):
+    """
+    Fija el precio de electricidad ($/kWh, en la moneda que use quien
+    opera este nodo puntual -- cada nodo puede tener su propia tarifa) que
+    se usa junto con `energy_wh` para estimar el costo electrico en la
+    pagina de detalle del nodo.
+    """
+    with db() as conn:
+        conn.execute("UPDATE nodes SET price_kwh=? WHERE node_id=?", (price_kwh, node_id))
+    return RedirectResponse(f"/admin/nodes/{node_id}", status_code=303)
+
+
+@app.post("/admin/nodes/{node_id}/reset-energy")
+def admin_reset_energy(node_id: str):
+    """Reinicia a cero el contador de energia acumulada (`energy_wh`) de
+    un nodo, por ejemplo al arrancar un periodo de facturacion nuevo."""
+    with db() as conn:
+        conn.execute("UPDATE nodes SET energy_wh=0 WHERE node_id=?", (node_id,))
+    return RedirectResponse(f"/admin/nodes/{node_id}", status_code=303)
 
 
 @app.post("/admin/jobs/{job_id}/delete")
